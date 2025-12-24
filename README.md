@@ -47,6 +47,56 @@ Features
 
 ---
 
+## Installation
+
+### 1. Install system dependencies
+
+On **Raspberry Pi / Debian / Ubuntu**:
+
+```bash
+sudo apt update
+sudo apt install python3 python3-pip python3-venv v4l-utils libatlas-base-dev libjasper-dev libharfbuzz0b libwebp6
+```
+
+On **Fedora / RHEL**:
+
+```bash
+sudo dnf install python3 python3-pip v4l-utils
+```
+
+### 2. Clone or download GlowBridge
+
+```bash
+cd /path/to/glowbridge
+```
+
+### 3. Create and activate a Python virtual environment (recommended)
+
+```bash
+python3 -m venv venv
+source venv/bin/activate
+```
+
+### 4. Install Python dependencies
+
+```bash
+pip install -r requirements.txt
+```
+
+### 5. Verify your V4L2 capture device
+
+```bash
+v4l2-ctl --list-devices
+```
+
+Ensure your device (e.g., `/dev/video0`) is present and accessible.
+
+### 6. Configure GlowBridge
+
+Edit or create a `config.toml` in the project directory (see [Configuration](#configuration) below for details), copy the `config.example.toml`, or use environment variables or CLI flags.
+
+---
+
 ## Quick Start
 1. Connect and verify your capture device (e.g., HDMI dongle):
    ```bash

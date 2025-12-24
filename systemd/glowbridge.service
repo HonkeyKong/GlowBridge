@@ -1,0 +1,33 @@
+[Unit]
+Description=GlowBridge Ambient Lighting Service
+After=network-online.target
+Wants=network-online.target
+
+# If your capture device is USB, this helps avoid race conditions
+After=dev-video0.device
+Wants=dev-video0.device
+
+[Service]
+Type=simple
+User=you
+group=video
+WorkingDirectory=/path/to/glowbridge_dir
+ExecStart=/usr/bin/python3 /path/to/glowbridge_dir/glowbridge.py
+Restart=on-failure
+RestartSec=2
+Environment=PYTHONUNBUFFERED=1
+
+# Optional: more resilient if the capture device is flaky
+StartLimitIntervalSec=30
+StartLimitBurst=10
+
+# Clean shutdown
+KillSignal=SIGTERM
+TimeoutStopSec=5
+
+# Basic hardening (safe defaults)
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
