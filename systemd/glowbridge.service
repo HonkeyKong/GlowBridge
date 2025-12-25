@@ -10,16 +10,11 @@ Wants=dev-video0.device
 [Service]
 Type=simple
 User=you
-group=video
 WorkingDirectory=/path/to/glowbridge_dir
 ExecStart=/usr/bin/python3 /path/to/glowbridge_dir/glowbridge.py
 Restart=on-failure
 RestartSec=2
 Environment=PYTHONUNBUFFERED=1
-
-# Optional: more resilient if the capture device is flaky
-StartLimitIntervalSec=30
-StartLimitBurst=10
 
 # Clean shutdown
 KillSignal=SIGTERM
