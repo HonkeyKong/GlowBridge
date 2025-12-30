@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+from html import parser
 import cv2
 import sys
 import time
@@ -33,6 +34,94 @@ def acquire_lock_or_die():
     except BlockingIOError:
         print("Another instance is already running (lock held). Exiting.", file=sys.stderr)
         sys.exit(2)
+
+def _ansi_bg(r: int, g: int, b: int) -> str:
+    # 24-bit background color, then reset later
+    return f"\x1b[48;2;{r};{g};{b}m"
+
+def _ansi_reset() -> str:
+    return "\x1b[0m"
+
+def build_preview_grid(colors: np.ndarray, right: int, top: int, left: int, bottom: int):
+    """
+    Build a 2D perimeter grid of indices into `colors` matching your CCW mapping:
+      idx 0..right-1     = RIGHT bottom->top
+      next top           = TOP right->left
+      next left          = LEFT top->bottom
+      last bottom        = BOTTOM left->right
+
+    Returns:
+      grid_idx: (H, W) int array, -1 for non-perimeter cells, else LED index
+      H, W chosen to fit the longest sides.
+    """
+    W = max(top, bottom)
+    H = max(left, right)
+
+    grid = -np.ones((H, W), dtype=np.int32)
+
+    idx = 0
+
+    # RIGHT column: bottom->top
+    x = W - 1
+    for i in range(right):
+        t = (i + 0.5) / right
+        y = int((H - 1) * (1.0 - t))  # bottom->top
+        grid[y, x] = idx
+        idx += 1
+
+    # TOP row: right->left
+    y = 0
+    for i in range(top):
+        t = (i + 0.5) / top
+        x = int((W - 1) * (1.0 - t))  # right->left
+        grid[y, x] = idx
+        idx += 1
+
+    # LEFT column: top->bottom
+    x = 0
+    for i in range(left):
+        t = (i + 0.5) / left
+        y = int((H - 1) * t)  # top->bottom
+        grid[y, x] = idx
+        idx += 1
+
+    # BOTTOM row: left->right
+    y = H - 1
+    for i in range(bottom):
+        t = (i + 0.5) / bottom
+        x = int((W - 1) * t)  # left->right
+        grid[y, x] = idx
+        idx += 1
+
+    return grid
+
+def render_preview_ansi(colors: np.ndarray, grid_idx: np.ndarray, stats: str = ""):
+    """
+    Draws a rectangular perimeter preview using ANSI background colors.
+    Uses two spaces per cell for a more square look.
+    """
+    # Move cursor to top-left and clear screen
+    out = ["\x1b[H\x1b[2J"]
+
+    H, W = grid_idx.shape
+    for y in range(H):
+        line = []
+        for x in range(W):
+            li = int(grid_idx[y, x])
+            if li < 0:
+                line.append(_ansi_reset() + "  ")
+            else:
+                r, g, b = (int(colors[li, 0]), int(colors[li, 1]), int(colors[li, 2]))
+                line.append(_ansi_bg(r, g, b) + "  ")
+        line.append(_ansi_reset())
+        out.append("".join(line))
+
+    if stats:
+        out.append(_ansi_reset() + stats)
+
+    sys.stdout.write("\n".join(out) + "\n")
+    sys.stdout.flush()
+
 
 def auto_crop_content_rgb(rgb_small: np.ndarray,
                           luma_thresh: int,
@@ -135,14 +224,13 @@ def handle_sigint(sig, frame):
 signal.signal(signal.SIGINT, handle_sigint)
 signal.signal(signal.SIGTERM, handle_sigint)
 
-def crop_center_16_9(frame_bgr: np.ndarray) -> np.ndarray:
-    h, w = frame_bgr.shape[:2]
-    target_h = int(w * 9 / 16)
-    if target_h <= 0 or target_h > h:
-        return frame_bgr  # can't crop sensibly, return as-is
-    y0 = (h - target_h) // 2
-    return frame_bgr[y0:y0 + target_h, :]
-
+# def crop_center_16_9(frame_bgr: np.ndarray) -> np.ndarray:
+#     h, w = frame_bgr.shape[:2]
+#     target_h = int(w * 9 / 16)
+#     if target_h <= 0 or target_h > h:
+#         return frame_bgr  # can't crop sensibly, return as-is
+#     y0 = (h - target_h) // 2
+#     return frame_bgr[y0:y0 + target_h, :]
 
 def sample_patch_rgb(img_rgb: np.ndarray, x: int, y: int, r: int) -> np.ndarray:
     h, w = img_rgb.shape[:2]
@@ -290,6 +378,8 @@ def main():
     parser.add_argument("--test-chase", action="store_true", help="Run LED chase test")
     parser.add_argument("--test-sides", action="store_true", help="Cycle sides one at a time (best for calibration)")
     parser.add_argument("--test-sides-all", action="store_true", help="Color all sides at once")
+    parser.add_argument("--preview", action="store_true", help="Show ANSI LED preview in terminal")
+    parser.add_argument("--preview-fps", type=float, default=12.0, help="Preview refresh rate (default: 12)")
     args = parser.parse_args()
 
     settings, args = load_settings(sys.argv[1:], app_name="glowbridge")
@@ -341,8 +431,8 @@ def main():
             # If capture hiccups, just skip this frame
             continue
 
-        if settings.video.crop_to_16_9:
-            frame = crop_center_16_9(frame)
+        # if settings.video.crop_to_16_9:
+        #     frame = crop_center_16_9(frame)
 
         # Downsample for cheap sampling
         frame_small = cv2.resize(frame, (settings.sampling.sample_w, settings.sampling.sample_h), interpolation=cv2.INTER_AREA)
@@ -399,6 +489,30 @@ def main():
         if colors_out.shape != (settings.layout.right + settings.layout.top + settings.layout.left + settings.layout.bottom, 3):
             print("BAD SHAPE:", colors_out.shape)
 
+        # ---- Preview setup (lazy init) ----
+        if args.preview and 'preview_grid' not in locals():
+            preview_grid = build_preview_grid(
+                colors_out,
+                settings.layout.right, settings.layout.top, settings.layout.left, settings.layout.bottom
+            )
+            preview_next = 0.0
+            # Hide cursor
+            sys.stdout.write("\x1b[?25l")
+            sys.stdout.flush()
+
+        # ---- Preview draw (rate-limited) ----
+        if args.preview:
+            nowp = time.perf_counter()
+            if nowp >= preview_next:
+                preview_next = nowp + (1.0 / max(1e-3, args.preview_fps))
+
+                mn = int(colors_out.min())
+                mx = int(colors_out.max())
+                mean = int(colors_out.mean())
+                stats = f"mean={mean}  min={mn}  max={mx}   (Ctrl+C to quit)"
+                render_preview_ansi(colors_out, preview_grid, stats=stats)
+
+
         # Build DRGB packet
         payload = bytearray(2 + settings.layout.led_count * 3)
         payload[0] = PROTO_DRGB
@@ -413,6 +527,9 @@ def main():
 
     # On exit, let WLED timeout quickly back to normal mode.
     # (We could also send a final packet with timeout=1 and black, but timeout is fine.)
+    sys.stdout.write("\x1b[?25h")
+    sys.stdout.flush()
+
     print("Stopped.")
     return 0
 

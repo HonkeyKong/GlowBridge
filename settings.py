@@ -335,6 +335,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--edge-margin", type=int)
     p.add_argument("--patch-r", type=int)
 
+    p.add_argument("--preview", action="store_true", help="Show LED Preview")
+    p.add_argument("--preview-fps", type=int, default=12, help="Preview update rate (Hz, default 12)")
+
     return p
 
 

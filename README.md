@@ -13,6 +13,7 @@ Features
 - Scene-cut detection with faster transitions on large luminance changes
 - EMA smoothing and per-frame step limiting for natural motion
 - Saturation and brightness boosting to avoid washed-out colors
+- Automatic image cropping to avoid sampling black bars
 - Built-in calibration modes: `--test-chase`, `--test-sides`, `--test-sides-all`
 
 ---
