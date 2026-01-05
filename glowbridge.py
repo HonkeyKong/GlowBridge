@@ -9,6 +9,7 @@ import signal
 import socket
 import argparse
 import numpy as np
+from types import SimpleNamespace
 
 from settings import load_settings
 
@@ -22,7 +23,6 @@ _lock_fd = None
 # bytes 2.. = RGBRGBRGB... for every LED in order  :contentReference[oaicite:4]{index=4}
 # ----------------------------
 PROTO_DRGB = 2
-TIMEOUT_SECONDS = 2
 
 running = True
 
@@ -191,6 +191,52 @@ def boost_saturation_rgb(colors: np.ndarray, sat_boost: float, val_boost: float)
     rgb2 = cv2.cvtColor(bgr2, cv2.COLOR_BGR2RGB)
     return rgb2.reshape(-1, 3)
 
+
+def apply_effects(colors_raw: np.ndarray, prev: "np.ndarray|None", effects: "EffectsCfg") -> tuple[np.ndarray, np.ndarray]:
+    """Apply black thresholding, saturation/value boost, and scene-cut aware smoothing.
+
+    Returns (colors_out_uint8, prev_float32_for_next_frame).
+    """
+    # 1) remove near-black noise
+    colors = apply_black_threshold(
+        colors_raw,
+        black_luma=effects.black_luma_threshold,
+        black_chroma=effects.black_chroma_threshold,
+    )
+
+    # 2) boost saturation/value to avoid washed look
+    colors = boost_saturation_rgb(colors, effects.sat_boost, effects.val_boost)
+
+    colors_f = colors.astype(np.float32)
+
+    if prev is None:
+        prev_f = colors_f
+    else:
+        prev_f = prev.astype(np.float32)
+
+        # Detect scene cut via average luma jump
+        l_prev = avg_luma(prev_f)
+        l_new = avg_luma(colors_f)
+        l_jump = abs(l_new - l_prev)
+
+        max_step = float(max(1.0, effects.max_step_per_frame))
+        if l_jump > float(effects.scene_cut_luma_jump):
+            # allow faster response on cuts
+            max_step *= float(effects.scene_cut_boost_mult)
+
+        # Clamp change per frame (prevents harsh flicker)
+        delta = colors_f - prev_f
+        delta = np.clip(delta, -max_step, max_step)
+        colors_f = prev_f + delta
+
+        # EMA smoothing
+        a = float(effects.smooth_alpha)
+        colors_f = (a * prev_f) + ((1.0 - a) * colors_f)
+
+        prev_f = colors_f
+
+    colors_out = np.clip(colors_f, 0, 255).astype(np.uint8)
+    return colors_out, prev_f
 def avg_luma(colors_f: np.ndarray) -> float:
     r = colors_f[:,0]; g = colors_f[:,1]; b = colors_f[:,2]
     return float((54*r + 183*g + 19*b).mean() / 256.0)
@@ -257,146 +303,243 @@ def build_led_colors_from_frame(sample_rgb: np.ndarray,
     m = max(0, min(edge_margin, w - 1, h - 1))
     r = patch_r
 
-    led_count = right + top + left + bottom
+    led_count = max(0, right) + max(0, top) + max(0, left) + max(0, bottom)
     colors = np.zeros((led_count, 3), dtype=np.uint8)
     idx = 0
 
-    # RIGHT (bottom->top)
-    x = w - 1 - m
-    for i in range(right):
-        t = (i + 0.5) / right
-        y = int((h - 1 - m) * (1.0 - t) + m * t)
-        colors[idx] = sample_patch_rgb(sample_rgb, x, y, r)
-        idx += 1
+    if right > 0:
+        x = w - 1 - m
+        for i in range(right):
+            t = (i + 0.5) / right
+            y = int((h - 1 - m) * (1.0 - t) + m * t)
+            colors[idx] = sample_patch_rgb(sample_rgb, x, y, r)
+            idx += 1
 
-    # TOP (right->left)
-    y = m
-    for i in range(top):
-        t = (i + 0.5) / top
-        x = int((w - 1 - m) * (1.0 - t) + m * t)
-        colors[idx] = sample_patch_rgb(sample_rgb, x, y, r)
-        idx += 1
+    if top > 0:
+        y = m
+        for i in range(top):
+            t = (i + 0.5) / top
+            x = int((w - 1 - m) * (1.0 - t) + m * t)
+            colors[idx] = sample_patch_rgb(sample_rgb, x, y, r)
+            idx += 1
 
-    # LEFT (top->bottom)
-    x = m
-    for i in range(left):
-        t = (i + 0.5) / left
-        y = int(m * (1.0 - t) + (h - 1 - m) * t)
-        colors[idx] = sample_patch_rgb(sample_rgb, x, y, r)
-        idx += 1
+    if left > 0:
+        x = m
+        for i in range(left):
+            t = (i + 0.5) / left
+            y = int(m * (1.0 - t) + (h - 1 - m) * t)
+            colors[idx] = sample_patch_rgb(sample_rgb, x, y, r)
+            idx += 1
 
-    # BOTTOM (left->right)
-    y = h - 1 - m
-    for i in range(bottom):
-        t = (i + 0.5) / bottom
-        x = int(m * (1.0 - t) + (w - 1 - m) * t)
-        colors[idx] = sample_patch_rgb(sample_rgb, x, y, r)
-        idx += 1
+    if bottom > 0:
+        y = h - 1 - m
+        for i in range(bottom):
+            t = (i + 0.5) / bottom
+            x = int(m * (1.0 - t) + (w - 1 - m) * t)
+            colors[idx] = sample_patch_rgb(sample_rgb, x, y, r)
+            idx += 1
 
     return colors
 
-def run_test_chase(sock, settings):
+
+def run_test_chase(sock, strip):
+    """Simple single-pixel chase to verify realtime UDP output."""
     idx = 0
     delay = 0.05  # seconds
 
+    led_count = int(getattr(strip.layout, "led_count", 0))
+    if led_count <= 0:
+        led_count = int(getattr(strip.layout, "right", 0) + getattr(strip.layout, "top", 0) +
+                        getattr(strip.layout, "left", 0) + getattr(strip.layout, "bottom", 0))
+    if led_count <= 0:
+        print(f"Strip '{getattr(strip, 'name', 'strip')}' has 0 LEDs configured; nothing to test.")
+        return
+
+    targets = getattr(strip, "targets", None)
+    if not targets:
+        # legacy single-target support
+        w = getattr(strip, "wled", None)
+        if w:
+            targets = [w]
+    if not targets:
+        print(f"Strip '{getattr(strip, 'name', 'strip')}' has no WLED targets configured.")
+        return
+
+    timeout_seconds = int(getattr(strip, "timeout_seconds", 2))
+
     print("Running TEST CHASE (Ctrl+C to stop)")
     while running:
-        colors = np.zeros((settings.layout.led_count, 3), dtype=np.uint8)
+        colors = np.zeros((led_count, 3), dtype=np.uint8)
         colors[idx] = [255, 255, 255]  # bright white pixel
+        send_wled(sock, colors, targets, timeout_seconds)
 
-        send_wled(sock, colors, settings)
-
-        idx = (idx + 1) % settings.layout.led_count
+        idx = (idx + 1) % led_count
         time.sleep(delay)
 
 
-def run_test_sides(sock, settings):
+def run_test_sides(sock, strip):
     """
     Cycles one side at a time so it's obvious what you're looking at.
-    RIGHT -> TOP -> LEFT -> BOTTOM, repeating.
+    Order: RIGHT -> TOP -> LEFT -> BOTTOM (skips disabled sides).
     """
-    print("Running TEST SIDES (cycling one side at a time). Ctrl+C to stop.")
-    sides = [
-        ("RIGHT (should be right side)", 0, settings.layout.right, [255, 0, 0]),                        # red
-        ("TOP (should be top side)", settings.layout.right, settings.layout.right + settings.layout.top, [0, 255, 0]),                  # green
-        ("LEFT (should be left side)", settings.layout.right + settings.layout.top, settings.layout.right + settings.layout.top + settings.layout.left, [0, 0, 255]),   # blue
-        ("BOTTOM (should be bottom)", settings.layout.right + settings.layout.top + settings.layout.left, settings.layout.led_count, [255, 255, 0]),    # yellow
-    ]
+    targets = getattr(strip, "targets", None)
+    if not targets:
+        w = getattr(strip, "wled", None)
+        if w:
+            targets = [w]
+    if not targets:
+        print(f"Strip '{getattr(strip, 'name', 'strip')}' has no WLED targets configured.")
+        return
 
+    r = int(getattr(strip.layout, "right", 0))
+    t = int(getattr(strip.layout, "top", 0))
+    l = int(getattr(strip.layout, "left", 0))
+    b = int(getattr(strip.layout, "bottom", 0))
+    led_count = int(getattr(strip.layout, "led_count", r + t + l + b))
+    if led_count <= 0:
+        print(f"Strip '{getattr(strip, 'name', 'strip')}' has 0 LEDs configured; nothing to test.")
+        return
+
+    # Build enabled side ranges dynamically
+    sides = []
+    off = 0
+    if r > 0:
+        sides.append(("RIGHT (should be right side)", off, off + r, [255, 0, 0]))  # red
+        off += r
+    if t > 0:
+        sides.append(("TOP (should be top side)", off, off + t, [0, 255, 0]))  # green
+        off += t
+    if l > 0:
+        sides.append(("LEFT (should be left side)", off, off + l, [0, 0, 255]))  # blue
+        off += l
+    if b > 0:
+        sides.append(("BOTTOM (should be bottom)", off, off + b, [255, 255, 0]))  # yellow
+        off += b
+
+    timeout_seconds = int(getattr(strip, "timeout_seconds", 2))
     on_time = 1.0
     off_time = 0.25
 
+    print("Running TEST SIDES (cycling one side at a time). Ctrl+C to stop.")
     while running:
         for name, start, end, color in sides:
             if not running:
                 break
             print(name)
-            colors = np.zeros((settings.layout.led_count, 3), dtype=np.uint8)
-            colors[start:end] = color
+            colors = np.zeros((led_count, 3), dtype=np.uint8)
+            if end > start:
+                colors[start:end] = color
 
             # keep realtime asserted, but don't spam
             t_end = time.perf_counter() + on_time
             while running and time.perf_counter() < t_end:
-                send_wled(sock, colors, settings)
+                send_wled(sock, colors, targets, timeout_seconds)
                 time.sleep(0.05)
 
             # brief off gap
             colors[:] = 0
             t_end = time.perf_counter() + off_time
             while running and time.perf_counter() < t_end:
-                send_wled(sock, colors, settings)
+                send_wled(sock, colors, targets, timeout_seconds)
                 time.sleep(0.05)
 
 
-def run_test_sides_all(sock, settings):
-    """Colors all sides at once (original behavior)."""
+def run_test_sides_all(sock, strip):
+    """Colors all enabled sides at once."""
+    targets = getattr(strip, "targets", None)
+    if not targets:
+        w = getattr(strip, "wled", None)
+        if w:
+            targets = [w]
+    if not targets:
+        print(f"Strip '{getattr(strip, 'name', 'strip')}' has no WLED targets configured.")
+        return
+
+    r = int(getattr(strip.layout, "right", 0))
+    t = int(getattr(strip.layout, "top", 0))
+    l = int(getattr(strip.layout, "left", 0))
+    b = int(getattr(strip.layout, "bottom", 0))
+    led_count = int(getattr(strip.layout, "led_count", r + t + l + b))
+    if led_count <= 0:
+        print(f"Strip '{getattr(strip, 'name', 'strip')}' has 0 LEDs configured; nothing to test.")
+        return
+
     print("Running TEST SIDES ALL (all sides at once). Ctrl+C to stop.")
-    colors = np.zeros((settings.layout.led_count, 3), dtype=np.uint8)
+    colors = np.zeros((led_count, 3), dtype=np.uint8)
     i = 0
+    if r > 0:
+        colors[i:i+r] = [255, 0, 0]; i += r        # RIGHT red
+    if t > 0:
+        colors[i:i+t] = [0, 255, 0]; i += t        # TOP green
+    if l > 0:
+        colors[i:i+l] = [0, 0, 255]; i += l        # LEFT blue
+    if b > 0:
+        colors[i:i+b] = [255, 255, 0]; i += b      # BOTTOM yellow
 
-    colors[i:i+settings.layout.right] = [255, 0, 0]; i += settings.layout.right       # RIGHT red
-    colors[i:i+settings.layout.top]   = [0, 255, 0]; i += settings.layout.top         # TOP green
-    colors[i:i+settings.layout.left]  = [0, 0, 255]; i += settings.layout.left        # LEFT blue
-    colors[i:i+settings.layout.bottom]= [255, 255, 0]; i += settings.layout.bottom    # BOTTOM yellow
-
+    timeout_seconds = int(getattr(strip, "timeout_seconds", 2))
     while running:
-        send_wled(sock, colors, settings)
+        send_wled(sock, colors, targets, timeout_seconds)
         time.sleep(0.05)
 
-def send_wled(sock, colors, settings):
-    payload = bytearray(2 + settings.layout.led_count * 3)
+def send_wled(sock, colors: np.ndarray, targets, timeout_seconds: int):
+    payload = bytearray(2 + colors.shape[0] * 3)
     payload[0] = PROTO_DRGB
-    payload[1] = TIMEOUT_SECONDS
+    payload[1] = max(1, min(255, int(timeout_seconds)))
     payload[2:] = colors.reshape(-1).tobytes()
-    sock.sendto(payload, (settings.wled.ip, settings.wled.port))
+    for t in targets:
+        sock.sendto(payload, (t.ip, t.port))
 
 
 def main():
-    acquire_lock_or_die()
-    last_dbg = 0.0
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--test-chase", action="store_true", help="Run LED chase test")
-    parser.add_argument("--test-sides", action="store_true", help="Cycle sides one at a time (best for calibration)")
-    parser.add_argument("--test-sides-all", action="store_true", help="Color all sides at once")
-    parser.add_argument("--preview", action="store_true", help="Show ANSI LED preview in terminal")
-    parser.add_argument("--preview-fps", type=float, default=12.0, help="Preview refresh rate (default: 12)")
-    args = parser.parse_args()
+    # Parse GlowBridge-only flags, then let settings.py parse the rest.
+    test_parser = argparse.ArgumentParser(add_help=False)
+    test_parser.add_argument("--test-chase", action="store_true", help="Run LED chase test (first/selected strip)")
+    test_parser.add_argument("--test-sides", action="store_true", help="Cycle sides one at a time (first/selected strip)")
+    test_parser.add_argument("--test-sides-all", action="store_true", help="Color all sides at once (first/selected strip)")
+    test_parser.add_argument("--strip", type=str, default=None, help="Select strip by name (defaults to first)")
+    test_args, remaining = test_parser.parse_known_args(sys.argv[1:])
 
-    settings, args = load_settings(sys.argv[1:], app_name="glowbridge")
+    settings, args = load_settings(remaining, app_name="glowbridge")
+
+    # Lock after loading settings so lock_path can be configured.
+    global LOCK_PATH
+    LOCK_PATH = getattr(settings, "lock_path", LOCK_PATH)
+    acquire_lock_or_die()
+
+    last_dbg = 0.0
+
 
     # UDP socket to WLED
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
-    if args.test_chase:
-        run_test_chase(sock, settings)
+    # Build strip list (new multi-strip or legacy single-strip config)
+    strips = list(getattr(settings, "strips", ()) or [])
+    if not strips:
+        strips = [SimpleNamespace(
+            name="default",
+            timeout_seconds=settings.wled.timeout_seconds,
+            layout=settings.layout,
+            targets=(SimpleNamespace(ip=settings.wled.ip, port=settings.wled.port),),
+        )]
+
+    # Choose strip for tests / preview
+    strip = strips[0]
+    if test_args.strip:
+        for st in strips:
+            if getattr(st, "name", "") == test_args.strip:
+                strip = st
+                break
+
+    if test_args.test_chase:
+        run_test_chase(sock, strip)
         return 0
 
-    if args.test_sides:
-        run_test_sides(sock, settings)
+    if test_args.test_sides:
+        run_test_sides(sock, strip)
         return 0
 
-    if args.test_sides_all:
-        run_test_sides_all(sock, settings)
+    if test_args.test_sides_all:
+        run_test_sides_all(sock, strip)
         return 0
 
     # Open capture
@@ -412,12 +555,13 @@ def main():
     cap.set(cv2.CAP_PROP_FPS, settings.video.cap_fps)
 
     # Smoothing buffer
-    prev = None
+    # prev = None
 
     frame_interval = 1.0 / max(1, settings.effects.out_fps)
     next_t = time.perf_counter()
 
-    print(f"Streaming {settings.layout.led_count} LEDs to WLED {settings.wled.ip}:{settings.wled.port} via DRGB realtime...")
+    print("Streaming to WLED via DRGB realtime...")
+    prev_colors: dict[str, np.ndarray] = {}
 
     while running:
         # pace output
@@ -448,80 +592,48 @@ def main():
                 min_w=settings.sampling.crop_min_w,
                 min_h=settings.sampling.crop_min_h,
             )
-
-        colors = build_led_colors_from_frame(
-            rgb,
-            settings.layout.right, settings.layout.top, settings.layout.left, settings.layout.bottom,
-            settings.sampling.edge_margin, settings.sampling.patch_r
-        )
-
-        # 1) Apply black threshold to reduce noise on blacks
-        colors = apply_black_threshold(
-            colors,
-            black_luma=settings.effects.black_luma_threshold,
-            black_chroma=settings.effects.black_chroma_threshold
-        )
-
-        # 2) Make colors less washed
-        colors = boost_saturation_rgb(colors, settings.effects.sat_boost, settings.effects.val_boost)
-
-        # 3) Scene-cut aware clamp + EMA smoothing
-        colors_f = colors.astype(np.float32)
-
-        if prev is None:
-            prev = colors_f
-        else:
-            # detect cut by luma jump
-            l_prev = avg_luma(prev)
-            l_new  = avg_luma(colors_f)
-            is_cut = abs(l_new - l_prev) >= settings.effects.scene_cut_luma_jump
-
-            step = settings.effects.max_step_per_frame * (settings.effects.scene_cut_boost_mult if is_cut else 1.0)
-            colors_f = limit_step(prev, colors_f, int(step))
-
-            if settings.effects.smooth_alpha > 0.0:
-                colors_f = (settings.effects.smooth_alpha * prev) + ((1.0 - settings.effects.smooth_alpha) * colors_f)
-
-            prev = colors_f
-
-        colors_out = np.clip(colors_f, 0, 255).astype(np.uint8)
-
-        if colors_out.shape != (settings.layout.right + settings.layout.top + settings.layout.left + settings.layout.bottom, 3):
-            print("BAD SHAPE:", colors_out.shape)
-
-        # ---- Preview setup (lazy init) ----
-        if args.preview and 'preview_grid' not in locals():
-            preview_grid = build_preview_grid(
-                colors_out,
-                settings.layout.right, settings.layout.top, settings.layout.left, settings.layout.bottom
-            )
-            preview_next = 0.0
-            # Hide cursor
-            sys.stdout.write("\x1b[?25l")
-            sys.stdout.flush()
-
-        # ---- Preview draw (rate-limited) ----
-        if args.preview:
-            nowp = time.perf_counter()
-            if nowp >= preview_next:
-                preview_next = nowp + (1.0 / max(1e-3, args.preview_fps))
-
-                mn = int(colors_out.min())
-                mx = int(colors_out.max())
-                mean = int(colors_out.mean())
-                stats = f"mean={mean}  min={mn}  max={mx}   (Ctrl+C to quit)"
-                render_preview_ansi(colors_out, preview_grid, stats=stats)
-
-
         # Build DRGB packet
-        payload = bytearray(2 + settings.layout.led_count * 3)
-        payload[0] = PROTO_DRGB
-        payload[1] = settings.wled.timeout_seconds
 
-        # Flatten RGB
-        payload[2:] = colors_out.reshape(-1).tobytes()
+        # Send to all configured strips/targets
+        for st in strips:
+            lay = st.layout
+            colors_raw = build_led_colors_from_frame(
+                rgb,
+                lay.right, lay.top, lay.left, lay.bottom,
+                settings.sampling.edge_margin, settings.sampling.patch_r
+            )
 
-        sock.sendto(payload, (settings.wled.ip, settings.wled.port))
+            prev = prev_colors.get(st.name)
+            if prev is None or prev.shape != colors_raw.shape:
+                prev = colors_raw.copy()
+
+            colors_out, prev_f = apply_effects(colors_raw, prev, settings.effects)
+            prev_colors[st.name] = prev_f
+
+            # --- Preview (selected strip only) ---
+            if args.preview and st is strip:
+                if 'preview_grid' not in locals():
+                    preview_grid = build_preview_grid(
+                        colors_out,
+                        lay.right, lay.top, lay.left, lay.bottom
+                    )
+                    # Hide cursor once
+                    sys.stdout.write("\x1b[?25l")
+                    sys.stdout.flush()
+                    preview_next = 0.0
+
+                nowp = time.perf_counter()
+                if nowp >= preview_next:
+                    preview_next = nowp + (1.0 / max(1e-3, args.preview_fps))
+                    mn = int(colors_out.min())
+                    mx = int(colors_out.max())
+                    mean = int(colors_out.mean())
+                    stats = f"{st.name}: mean={mean} min={mn} max={mx}  (Ctrl+C to quit)"
+                    render_preview_ansi(colors_out, preview_grid, stats=stats)
+            # --- Send to WLED ---
+
+            send_wled(sock, colors_out, st.targets, st.timeout_seconds)
+
 
     cap.release()
 

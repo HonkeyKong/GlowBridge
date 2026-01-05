@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, replace, field
 from pathlib import Path
 import argparse
 import os
@@ -42,6 +42,11 @@ class WledCfg:
     ip: str = "192.168.1.150"
     port: int = 21324
     timeout_seconds: int = 2
+@dataclass(frozen=True)
+class WledTargetCfg:
+    ip: str
+    port: int = 21324
+
 
 
 @dataclass(frozen=True)
@@ -80,10 +85,21 @@ class LayoutCfg:
     @property
     def led_count(self) -> int:
         return self.right + self.top + self.left + self.bottom
+@dataclass(frozen=True)
+class StripCfg:
+    name: str = "strip0"
+    timeout_seconds: int = 2
+    layout: "LayoutCfg" = field(default_factory=lambda: LayoutCfg())  # type: ignore
+    targets: tuple[WledTargetCfg, ...] = ()
+
+    @property
+    def led_count(self) -> int:
+        return 0 if self.layout is None else self.layout.led_count
 
 
 @dataclass(frozen=True)
 class EffectsCfg:
+
     out_fps: int = 30
     smooth_alpha: float = 0.88
     max_step_per_frame: int = 48
@@ -100,28 +116,50 @@ class EffectsCfg:
 
 @dataclass(frozen=True)
 class Settings:
+    # New: one capture, many output strips
+    strips: tuple[StripCfg, ...] = ()
+
+    # Legacy (still supported for single-strip configs)
     wled: WledCfg = WledCfg()
     video: VideoCfg = VideoCfg()
     sampling: SamplingCfg = SamplingCfg()
     layout: LayoutCfg = LayoutCfg()
     effects: EffectsCfg = EffectsCfg()
 
-    # Optional: lock path etc. live here too if you want
     lock_path: str = "/tmp/glowbridge.lock"
 
     def summary(self) -> str:
-        return (
-            "Settings:\n"
-            f"  WLED: {self.wled.ip}:{self.wled.port} timeout={self.wled.timeout_seconds}s\n"
-            f"  Video: dev={self.video.device} {self.video.cap_w}x{self.video.cap_h}@{self.video.cap_fps} crop16:9={self.video.crop_to_16_9}\n"
-            f"  Layout: R={self.layout.right} T={self.layout.top} L={self.layout.left} B={self.layout.bottom} total={self.layout.led_count}\n"
-            f"  Sampling: {self.sampling.sample_w}x{self.sampling.sample_h} margin={self.sampling.edge_margin} patch_r={self.sampling.patch_r}\n"
+        lines: list[str] = ["Settings:"]
+        if self.strips:
+            lines.append(f"  Strips: {len(self.strips)}")
+            for st in self.strips:
+                tgt = ", ".join([f"{t.ip}:{t.port}" for t in st.targets]) or "(no targets)"
+                lay = st.layout or LayoutCfg()
+                lines.append(
+                    f"    - {st.name}: timeout={st.timeout_seconds}s "
+                    f"layout(R={lay.right} T={lay.top} L={lay.left} B={lay.bottom} total={lay.led_count}) "
+                    f"targets={tgt}"
+                )
+        else:
+            lines.append(f"  WLED: {self.wled.ip}:{self.wled.port} timeout={self.wled.timeout_seconds}s")
+            lines.append(
+                f"  Layout: R={self.layout.right} T={self.layout.top} L={self.layout.left} B={self.layout.bottom} total={self.layout.led_count}"
+            )
+
+        lines.append(
+            f"  Video: dev={self.video.device} {self.video.cap_w}x{self.video.cap_h}@{self.video.cap_fps} crop16:9={self.video.crop_to_16_9}"
+        )
+        lines.append(
+            f"  Sampling: {self.sampling.sample_w}x{self.sampling.sample_h} margin={self.sampling.edge_margin} patch_r={self.sampling.patch_r}"
+        )
+        lines.append(
             f"  Effects: out_fps={self.effects.out_fps} smooth={self.effects.smooth_alpha} step={self.effects.max_step_per_frame} "
             f"black(luma={self.effects.black_luma_threshold}, chroma={self.effects.black_chroma_threshold}) "
             f"cut(jump={self.effects.scene_cut_luma_jump}, mult={self.effects.scene_cut_boost_mult}) "
-            f"boost(sat={self.effects.sat_boost}, val={self.effects.val_boost})\n"
-            f"  Lock: {self.lock_path}\n"
+            f"boost(sat={self.effects.sat_boost}, val={self.effects.val_boost})"
         )
+        lines.append(f"  Lock: {self.lock_path}")
+        return "\n".join(lines) + "\n"
 
 
 # -----------------------------
@@ -212,9 +250,51 @@ def merge_from_dict(s: Settings, d: dict) -> Settings:
         val_boost=_flt("effects", "val_boost", e.val_boost),
     )
 
+    # Multi-strip config: strips = [ { ... }, ... ]
+    strips_val: tuple[StripCfg, ...] = ()
+    strips_list = d.get('strips')
+    if not isinstance(strips_list, list):
+        # Back-compat: allow strips to live under [layout] as layout.strips
+        lay_sec = d.get('layout', {})
+        if isinstance(lay_sec, dict):
+            strips_list = lay_sec.get('strips')
+    if isinstance(strips_list, list):
+        strip_objs: list[StripCfg] = []
+        for i, sd in enumerate(strips_list or []):
+            if not isinstance(sd, dict):
+                continue
+            name = sd.get("name") or f"strip{i}"
+            timeout = int(sd.get("timeout_seconds", w.timeout_seconds))
+
+            r = int(sd.get("right", lay.right))
+            t = int(sd.get("top", lay.top))
+            l = int(sd.get("left", lay.left))
+            b = int(sd.get("bottom", lay.bottom))
+            start_corner = str(sd.get("start_corner", lay.start_corner))
+            direction = str(sd.get("direction", lay.direction))
+            layout2 = LayoutCfg(right=r, top=t, left=l, bottom=b, start_corner=start_corner, direction=direction)
+
+            targets: list[WledTargetCfg] = []
+            if isinstance(sd.get("targets"), list):
+                for td in sd.get("targets") or []:
+                    if not isinstance(td, dict):
+                        continue
+                    ip = td.get("ip")
+                    if not ip:
+                        continue
+                    port = int(td.get("port", w.port))
+                    targets.append(WledTargetCfg(ip=str(ip), port=port))
+
+            if not targets:
+                targets = [WledTargetCfg(ip=w.ip, port=w.port)]
+
+            strip_objs.append(StripCfg(name=str(name), timeout_seconds=timeout, layout=layout2, targets=tuple(targets)))
+
+        strips_val = tuple(strip_objs)
+
     lock_path = d.get("lock_path", s.lock_path)
 
-    return Settings(wled=w, video=v, sampling=samp, layout=lay, effects=e, lock_path=lock_path)
+    return Settings(strips=strips_val, wled=w, video=v, sampling=samp, layout=lay, effects=e, lock_path=lock_path)
 
 
 # -----------------------------
@@ -234,6 +314,8 @@ def apply_env(s: Settings) -> Settings:
     env = os.environ
 
     w = s.wled
+    strips_val = s.strips
+
     v = s.video
     lay = s.layout
     e = s.effects
@@ -249,6 +331,25 @@ def apply_env(s: Settings) -> Settings:
         w = replace(w, port=_as_int(E("WLED_PORT")))
     if E("WLED_TIMEOUT"):
         w = replace(w, timeout_seconds=_as_int(E("WLED_TIMEOUT")))
+    # If strips are configured, allow env WLED_* to override all strip targets too.
+    if strips_val and (E("WLED_IP") or E("WLED_PORT") or E("WLED_TIMEOUT")):
+        env_ip = E("WLED_IP")
+        env_port = _as_int(E("WLED_PORT")) if E("WLED_PORT") else None
+        env_timeout = _as_int(E("WLED_TIMEOUT")) if E("WLED_TIMEOUT") else None
+
+        new_strips: list[StripCfg] = []
+        for st in strips_val:
+            targets = st.targets
+            if env_ip or env_port:
+                # Replace every target; if env_port not set, keep existing per-target port.
+                targets = tuple(
+                    replace(t, ip=(env_ip or t.ip), port=(env_port if env_port is not None else t.port))
+                    for t in (targets if targets else (WledTargetCfg(ip=(env_ip or w.ip), port=(env_port if env_port is not None else w.port)),))
+                )
+            timeout_seconds = env_timeout if env_timeout is not None else st.timeout_seconds
+            new_strips.append(replace(st, targets=targets, timeout_seconds=timeout_seconds))
+        strips_val = tuple(new_strips)
+
 
     # Video
     if E("VIDEO_DEV"):
@@ -294,7 +395,7 @@ def apply_env(s: Settings) -> Settings:
     if E("LOCK_PATH"):
         lock_path = E("LOCK_PATH") or lock_path
 
-    return Settings(wled=w, video=v, sampling=samp, layout=lay, effects=e, lock_path=lock_path)
+    return Settings(strips=strips_val, wled=w, video=v, sampling=samp, layout=lay, effects=e, lock_path=lock_path)
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -393,7 +494,7 @@ def apply_cli(s: Settings, args: argparse.Namespace) -> Settings:
     if args.patch_r is not None:
         samp = replace(samp, patch_r=args.patch_r)
 
-    return Settings(wled=w, video=v, sampling=samp, layout=lay, effects=e, lock_path=s.lock_path)
+    return Settings(strips=s.strips, wled=w, video=v, sampling=samp, layout=lay, effects=e, lock_path=s.lock_path)
 
 
 def load_settings(argv: list[str] | None = None, app_name: str = "glowbridge") -> tuple[Settings, argparse.Namespace]:
@@ -429,8 +530,20 @@ def load_settings(argv: list[str] | None = None, app_name: str = "glowbridge") -
         raise ValueError("LED count is zero/negative, check layout config.")
     if s.effects.out_fps <= 0:
         raise ValueError("out_fps must be > 0.")
-    if s.wled.port <= 0 or s.wled.port > 65535:
-        raise ValueError("wled.port must be 1..65535.")
+    if s.strips:
+        for st in s.strips:
+            if st.timeout_seconds <= 0 or st.timeout_seconds > 255:
+                raise ValueError("strip.timeout_seconds must be 1..255.")
+            if st.layout is None or st.layout.led_count <= 0:
+                raise ValueError(f"strip '{st.name}' must have at least 1 LED across enabled sides.")
+            if not st.targets:
+                raise ValueError(f"strip '{st.name}' must have at least one WLED target.")
+            for tgt in st.targets:
+                if tgt.port <= 0 or tgt.port > 65535:
+                    raise ValueError("wled.port must be 1..65535.")
+    else:
+        if s.wled.port <= 0 or s.wled.port > 65535:
+            raise ValueError("wled.port must be 1..65535.")
     if s.video.cap_w <= 0 or s.video.cap_h <= 0:
         raise ValueError("Capture size must be > 0.")
     if s.sampling.sample_w <= 0 or s.sampling.sample_h <= 0:

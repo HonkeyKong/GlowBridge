@@ -1,34 +1,28 @@
-[wled]
-ip = "192.168.1.150"
-port = 21324
-timeout_seconds = 2
+# GlowBridge configuration (TOML)
+#
+# You can use either:
+#   1) Legacy single-strip config: [wled] + [layout]
+#   2) Multi-strip config: strips = [ { ... }, { ... } ]
+#
+# In multi-strip mode, each strip can:
+#   - output to multiple WLED instances (targets = [{ip,port}, ...])
+#   - enable only some sides by setting that side's LED count to 0
+#
+# Tip: WLED must have "Realtime" enabled (it is by default).
+
+lock_path = "/tmp/glowbridge.lock"
 
 [video]
 device = "/dev/video0"
 cap_w = 640
 cap_h = 480
 cap_fps = 30
-crop_to_16_9 = true
 
 [sampling]
 sample_w = 160
 sample_h = 90
-edge_margin = 3
+edge_margin = 6
 patch_r = 2
-auto_crop_black_bars = true
-crop_luma_threshold = 16      # 12..30 typical
-crop_min_percent = 0.08       # 0.05..0.15: how much of the row/col must be "bright"
-crop_pad = 2                  # pixels of padding in the downsampled image
-crop_min_w = 80               # don't crop smaller than this
-crop_min_h = 45
-
-[layout]
-right = 17
-top = 26
-left = 15
-bottom = 11
-start_corner = "bottom_right"
-direction = "ccw"
 
 [effects]
 out_fps = 30
@@ -40,3 +34,34 @@ scene_cut_luma_jump = 20
 scene_cut_boost_mult = 3.0
 sat_boost = 1.35
 val_boost = 1.05
+
+# -------------------------
+# Multi-strip output (preferred)
+# -------------------------
+# Each entry is a "strip" definition.
+# right/top/left/bottom = LED counts per side. Set any side to 0 to disable it.
+
+# Example: mirror to two WLED devices
+strips = [
+  { name="tv", timeout_seconds=2, right=12, top=22, left=12, bottom=22, targets=[ { ip="192.168.1.50", port=21324 } ] },
+
+  # Example: second strip using only bottom+left, sending to one WLED
+  { name="shelf", timeout_seconds=2, right=0, top=0, left=15, bottom=25, targets=[ { ip="192.168.1.51" } ] }
+]
+
+# -------------------------
+# Legacy single-strip output (still supported)
+# -------------------------
+[wled]
+ip = "192.168.1.50"
+port = 21324
+timeout_seconds = 2
+
+[layout]
+right = 24
+top = 36
+left = 24
+bottom = 36
+# start_corner and direction are placeholders for future mapping features.
+start_corner = "bottom_right"
+direction = "clockwise"
