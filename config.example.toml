@@ -36,32 +36,16 @@ sat_boost = 1.35
 val_boost = 1.05
 
 # -------------------------
-# Multi-strip output (preferred)
+# Multi-strip output
 # -------------------------
 # Each entry is a "strip" definition.
 # right/top/left/bottom = LED counts per side. Set any side to 0 to disable it.
 
 # Example: mirror to two WLED devices
+[layout]
 strips = [
-  { name="tv", timeout_seconds=2, right=12, top=22, left=12, bottom=22, targets=[ { ip="192.168.1.50", port=21324 } ] },
+  { name="tv", timeout_seconds=2, right=12, top=22, left=12, bottom=22, targets=[ { ip="192.168.1.50" } ] },
 
   # Example: second strip using only bottom+left, sending to one WLED
-  { name="shelf", timeout_seconds=2, right=0, top=0, left=15, bottom=25, targets=[ { ip="192.168.1.51" } ] }
+  { name="shelf", timeout_seconds=2, right=0, top=0, left=15, bottom=25, targets=[ { ip="192.168.1.51", port=21324 } ] }
 ]
-
-# -------------------------
-# Legacy single-strip output (still supported)
-# -------------------------
-[wled]
-ip = "192.168.1.50"
-port = 21324
-timeout_seconds = 2
-
-[layout]
-right = 24
-top = 36
-left = 24
-bottom = 36
-# start_corner and direction are placeholders for future mapping features.
-start_corner = "bottom_right"
-direction = "clockwise"

@@ -41,14 +41,15 @@ Features
 
 ## Bill of Materials
 
-| Component              | Example                                                    | Approx. Price (USD) | Notes                          |
-| ---------------------- | ---------------------------------------------------------- | ------------------- | ------------------------------ |
-| Raspberry Pi           | [Pi 3B+ / Pi 4 / Pi Zero 2 W](https://a.co/d/8MqKKTY)      | \$15–\$45           | Pi 3+ recommended for Ethernet |
-| HDMI → USB Capture     | [Generic UVC adapter](https://a.co/d/9cMBmpn)              | \$5–\$25            | Must support MJPEG             |
-| LED Strip              | [WS2812B](https://a.co/d/83mTGrY)                          | \$5–\$20            | ~150–300 LEDs typical          |
-| WLED Controller        | [GLEDOPTO ESP8266 WLED Controller](https://a.co/d/hd0Iq79) | \$3–$25             | ESP8266 also works             |
-| Power Supply (LEDs)    | [5V 5A+](https://a.co/d/gNvGSdp)                           | \$10–\$30           | Depends on LED count           |
-| Wiring / Level Shifter | Optional                                                   | \$2–\$5             | Recommended for long runs      |
+| Component           | Example                                                    | Approx. Price (USD) | Notes                          |
+| ------------------- | ---------------------------------------------------------- | ------------------- | ------------------------------ |
+| Raspberry Pi        | [Pi 3B+ / Pi 4 / Pi Zero 2 W](https://a.co/d/8MqKKTY)      | \$15–\$45           | Pi 3+ recommended for Ethernet |
+| HDMI → USB Capture  | [Generic UVC adapter](https://a.co/d/9cMBmpn)              | \$5–\$25            | Must support MJPEG             |
+| LED Strip           | [WS2812B](https://a.co/d/83mTGrY)                          | \$5–\$20            | ~150–300 LEDs typical          |
+| WLED Controller     | [GLEDOPTO ESP8266 WLED Controller](https://a.co/d/hd0Iq79) | \$3–$25             | ESP8266 also works             |
+| Power Supply (LEDs) | [5V 5A+](https://a.co/d/gNvGSdp)                           | \$10–\$30           | Depends on LED count           |
+
+- Note: For your power needs, you can use this [WLED Calculator](https://wled-calculator.github.io/).
 
 ---
 
@@ -109,14 +110,19 @@ Edit or create a `config.toml` in the project directory (see [Configuration](#co
    ```bash
    v4l2-ctl --list-devices
    ```
+
 2. Configure WLED IP/port, LED counts, and video device (see Configuration below).
+   
    - Lots of cheap LED strips group multiple LEDs per chip (often 3). Count those groups as one LED. The default 69 LEDs in the script represent 207 physical LEDs on such strips.
+
 3. Run a test to confirm mapping:
    
    ```bash
    python3 glowbridge.py --test-sides
    ```
+   
    - It cycles RIGHT → TOP → LEFT → BOTTOM so you can confirm orientation. You can also run with `--test-sides-all` to light up all sides at once.
+
 4. Start streaming:
    
    ```bash
@@ -183,6 +189,7 @@ lock_path = "/tmp/glowbridge.lock"
 ### Multi-strip configuration (recommended)
 
 For multiple LED strips or WLED devices, use the `strips` array. Each strip can:
+
 - Output to one or more WLED targets (mirror the same colors to multiple devices)
 - Enable only specific sides by setting unwanted sides to `0`
 - Have independent timeout settings
@@ -212,6 +219,7 @@ sat_boost = 1.35
 val_boost = 1.05
 
 # Define multiple strips with different layouts and targets
+[layout]
 strips = [
   # Main TV backlight with all four sides
   { 
@@ -295,10 +303,12 @@ Tune these keys (via config file, env vars, or CLI) to fit your hardware:
 ### LED Layout (counter-clockwise)
 
 **Legacy mode**:
+
 - `layout.right`, `layout.top`, `layout.left`, `layout.bottom`: number of LEDs on each side
 - `layout.led_count`: derived total, must match strip length in WLED
 
 **Multi-strip mode**:
+
 - Each strip in the `strips` array has its own `right`, `top`, `left`, `bottom` counts
 - Set any side to `0` to disable it (e.g., `right = 0, top = 0` for only left+bottom LEDs)
 - Each strip independently calculates `led_count` from its enabled sides
