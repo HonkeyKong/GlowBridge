@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 
-from html import parser
+import os
 import cv2
 import sys
 import time
@@ -9,22 +9,133 @@ import signal
 import socket
 import argparse
 import numpy as np
+from html import parser
+from pathlib import Path
 from types import SimpleNamespace
-
 from settings import load_settings
 
-LOCK_PATH = "/tmp/glowbridge.lock"
 _lock_fd = None
-
-# ----------------------------
-# WLED DRGB packet:
-# byte0 = 2 (DRGB)
-# byte1 = timeout seconds (1-2 recommended)
-# bytes 2.. = RGBRGBRGB... for every LED in order  :contentReference[oaicite:4]{index=4}
-# ----------------------------
-PROTO_DRGB = 2
-
 running = True
+
+LOCK_PATH = "/tmp/glowbridge.lock"
+
+import os
+from pathlib import Path
+
+def _read_text(path: Path) -> str:
+    try:
+        return path.read_text(errors="ignore")
+    except Exception:
+        return ""
+
+def _is_usb_video_node(video: str) -> bool:
+    # video like "video0"
+    base = Path("/sys/class/video4linux") / video
+    uevent = _read_text(base / "device" / "uevent")
+    if "ID_BUS=usb" in uevent:
+        return True
+
+    # Fallback: resolve sysfs path and look for "/usb"
+    try:
+        dev_path = (base / "device").resolve()
+        return "/usb" in str(dev_path)
+    except Exception:
+        return False
+
+def _pick_v4l_by_id(prefer_usb: bool = True) -> str | None:
+    """
+    Returns a stable symlink path like /dev/v4l/by-id/usb-...-video-index0
+    or None if not available.
+    """
+    by_id = Path("/dev/v4l/by-id")
+    if not by_id.exists():
+        return None
+
+    # Only consider entries that point to a video node
+    entries = []
+    for p in sorted(by_id.iterdir()):
+        try:
+            target = p.resolve()  # -> /dev/videoX
+        except Exception:
+            continue
+        if target.name.startswith("video"):
+            entries.append((p, target))
+
+    if not entries:
+        return None
+
+    # If requested, filter to USB-backed video nodes using sysfs
+    if prefer_usb:
+        usb_entries = []
+        for link, target in entries:
+            if _is_usb_video_node(target.name):
+                usb_entries.append((link, target))
+        entries = usb_entries or entries
+
+    # Heuristic: prefer "video-index0" (usually the capture stream)
+    def score(item):
+        link, target = item
+        name = link.name.lower()
+        s = 0
+        if "video-index0" in name:
+            s -= 100
+        if "index0" in name:
+            s -= 25
+        # lower /dev/video number is a mild preference
+        try:
+            s += int(target.name.replace("video", "")) * 0.1
+        except Exception:
+            pass
+        return s
+
+    best_link, _ = sorted(entries, key=score)[0]
+    return str(best_link)
+
+def autodetect_video_device(prefer_usb: bool = True, verify_frames: bool = True) -> str | None:
+    """
+    Returns a device path to open with OpenCV:
+      - Prefer /dev/v4l/by-id/* (stable)
+      - Fallback to /dev/videoX detected as USB via sysfs
+      - Optionally verify capture works by reading a frame
+    """
+    # 1) Stable by-id path (best UX)
+    by_id = _pick_v4l_by_id(prefer_usb=prefer_usb)
+    if by_id:
+        if not verify_frames:
+            return by_id
+        cap = cv2.VideoCapture(by_id, cv2.CAP_V4L2)
+        if cap.isOpened():
+            ok, frame = cap.read()
+            cap.release()
+            if ok and frame is not None:
+                return by_id
+        else:
+            cap.release()
+
+    # 2) Fallback: enumerate /dev/video* and pick USB
+    sys_base = Path("/sys/class/video4linux")
+    if not sys_base.exists():
+        return None
+
+    vids = sorted([p.name for p in sys_base.iterdir() if p.name.startswith("video")],
+                  key=lambda s: int(s.replace("video", "") or "9999"))
+
+    candidates = [v for v in vids if (not prefer_usb or _is_usb_video_node(v))] or vids
+
+    if verify_frames:
+        for v in candidates:
+            dev = f"/dev/{v}"
+            cap = cv2.VideoCapture(dev, cv2.CAP_V4L2)
+            if not cap.isOpened():
+                cap.release()
+                continue
+            ok, frame = cap.read()
+            cap.release()
+            if ok and frame is not None:
+                return dev
+        return None
+
+    return f"/dev/{candidates[0]}" if candidates else None
 
 def acquire_lock_or_die():
     global _lock_fd
@@ -481,6 +592,15 @@ def run_test_sides_all(sock, strip):
         send_wled(sock, colors, targets, timeout_seconds)
         time.sleep(0.05)
 
+# ----------------------------
+# WLED DRGB packet:
+# byte0 = 2 (DRGB)
+# byte1 = timeout seconds (1-2 recommended)
+# bytes 2.. = RGBRGBRGB... for every LED in order
+# ----------------------------
+
+PROTO_DRGB = 2
+
 def send_wled(sock, colors: np.ndarray, targets, timeout_seconds: int):
     payload = bytearray(2 + colors.shape[0] * 3)
     payload[0] = PROTO_DRGB
@@ -543,7 +663,17 @@ def main():
         return 0
 
     # Open capture
-    cap = cv2.VideoCapture(settings.video.device, cv2.CAP_V4L2)
+    video_dev = settings.video.device
+    if not video_dev or str(video_dev).lower() == "auto":
+        detected = autodetect_video_device(prefer_usb=True, verify_frames=True)
+        if not detected:
+            print("ERROR: Could not auto-detect a working capture device.", file=sys.stderr)
+            return 1
+        video_dev = detected
+        print(f"Auto-detected capture device: {video_dev}")
+
+    cap = cv2.VideoCapture(video_dev, cv2.CAP_V4L2)
+
     if not cap.isOpened():
         print(f"ERROR: Could not open {settings.video.device}", file=sys.stderr)
         return 1
@@ -553,9 +683,6 @@ def main():
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, settings.video.cap_w)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, settings.video.cap_h)
     cap.set(cv2.CAP_PROP_FPS, settings.video.cap_fps)
-
-    # Smoothing buffer
-    # prev = None
 
     frame_interval = 1.0 / max(1, settings.effects.out_fps)
     next_t = time.perf_counter()
@@ -574,9 +701,6 @@ def main():
         if not ok or frame is None:
             # If capture hiccups, just skip this frame
             continue
-
-        # if settings.video.crop_to_16_9:
-        #     frame = crop_center_16_9(frame)
 
         # Downsample for cheap sampling
         frame_small = cv2.resize(frame, (settings.sampling.sample_w, settings.sampling.sample_h), interpolation=cv2.INTER_AREA)

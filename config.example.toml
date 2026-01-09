@@ -13,7 +13,7 @@
 lock_path = "/tmp/glowbridge.lock"
 
 [video]
-device = "/dev/video0"
+device = "auto"
 cap_w = 640
 cap_h = 480
 cap_fps = 30

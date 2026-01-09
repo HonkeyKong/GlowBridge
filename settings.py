@@ -13,14 +13,11 @@ try:
 except Exception:
     tomllib = None  # noqa
 
-
 def _as_int(v: str) -> int:
     return int(v.strip())
 
-
 def _as_float(v: str) -> float:
     return float(v.strip())
-
 
 def _as_bool(v: str) -> bool:
     s = v.strip().lower()
@@ -30,12 +27,10 @@ def _as_bool(v: str) -> bool:
         return False
     raise ValueError(f"Not a boolean: {v!r}")
 
-
 def _expand_path(p: str | None) -> Path | None:
     if not p:
         return None
     return Path(os.path.expanduser(p)).resolve()
-
 
 @dataclass(frozen=True)
 class WledCfg:
@@ -47,16 +42,13 @@ class WledTargetCfg:
     ip: str
     port: int = 21324
 
-
-
 @dataclass(frozen=True)
 class VideoCfg:
-    device: str = "/dev/video0"
+    device: str = "auto"
     cap_w: int = 640
     cap_h: int = 480
     cap_fps: int = 30
-    crop_to_16_9: bool = True
-
+    # crop_to_16_9: bool = True
 
 @dataclass(frozen=True)
 class SamplingCfg:
@@ -71,7 +63,6 @@ class SamplingCfg:
     crop_min_w: int = 80
     crop_min_h: int = 45
 
-
 @dataclass(frozen=True)
 class LayoutCfg:
     # Counter-clockwise, start at bottom-right by default.
@@ -85,6 +76,7 @@ class LayoutCfg:
     @property
     def led_count(self) -> int:
         return self.right + self.top + self.left + self.bottom
+
 @dataclass(frozen=True)
 class StripCfg:
     name: str = "strip0"
@@ -95,7 +87,6 @@ class StripCfg:
     @property
     def led_count(self) -> int:
         return 0 if self.layout is None else self.layout.led_count
-
 
 @dataclass(frozen=True)
 class EffectsCfg:
@@ -112,7 +103,6 @@ class EffectsCfg:
 
     sat_boost: float = 1.35
     val_boost: float = 1.05
-
 
 @dataclass(frozen=True)
 class Settings:
@@ -147,7 +137,7 @@ class Settings:
             )
 
         lines.append(
-            f"  Video: dev={self.video.device} {self.video.cap_w}x{self.video.cap_h}@{self.video.cap_fps} crop16:9={self.video.crop_to_16_9}"
+            f"  Video: dev={self.video.device} {self.video.cap_w}x{self.video.cap_h}@{self.video.cap_fps}" # crop16:9={self.video.crop_to_16_9}"
         )
         lines.append(
             f"  Sampling: {self.sampling.sample_w}x{self.sampling.sample_h} margin={self.sampling.edge_margin} patch_r={self.sampling.patch_r}"
@@ -161,7 +151,6 @@ class Settings:
         lines.append(f"  Lock: {self.lock_path}")
         return "\n".join(lines) + "\n"
 
-
 # -----------------------------
 # Config loading
 # -----------------------------
@@ -173,7 +162,6 @@ def default_config_paths(app_name: str = "glowbridge") -> list[Path]:
         Path("/etc") / app_name / "config.toml",
     ]
 
-
 def load_toml(path: Path) -> dict:
     if tomllib is None:
         raise RuntimeError(
@@ -181,7 +169,6 @@ def load_toml(path: Path) -> dict:
         )
     data = path.read_bytes()
     return tomllib.loads(data.decode("utf-8"))
-
 
 def merge_from_dict(s: Settings, d: dict) -> Settings:
     # Nested helpers
@@ -209,7 +196,6 @@ def merge_from_dict(s: Settings, d: dict) -> Settings:
         cap_w=get("video", "cap_w", int) or v.cap_w,
         cap_h=get("video", "cap_h", int) or v.cap_h,
         cap_fps=get("video", "cap_fps", int) or v.cap_fps,
-        crop_to_16_9=get("video", "crop_to_16_9", bool) if get("video", "crop_to_16_9") is not None else v.crop_to_16_9,
     )
 
     # Sampling
@@ -296,7 +282,6 @@ def merge_from_dict(s: Settings, d: dict) -> Settings:
 
     return Settings(strips=strips_val, wled=w, video=v, sampling=samp, layout=lay, effects=e, lock_path=lock_path)
 
-
 # -----------------------------
 # Env + CLI
 # -----------------------------
@@ -350,7 +335,6 @@ def apply_env(s: Settings) -> Settings:
             new_strips.append(replace(st, targets=targets, timeout_seconds=timeout_seconds))
         strips_val = tuple(new_strips)
 
-
     # Video
     if E("VIDEO_DEV"):
         v = replace(v, device=E("VIDEO_DEV") or v.device)
@@ -397,7 +381,6 @@ def apply_env(s: Settings) -> Settings:
 
     return Settings(strips=strips_val, wled=w, video=v, sampling=samp, layout=lay, effects=e, lock_path=lock_path)
 
-
 def build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(add_help=True)
 
@@ -440,7 +423,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--preview-fps", type=int, default=12, help="Preview update rate (Hz, default 12)")
 
     return p
-
 
 def apply_cli(s: Settings, args: argparse.Namespace) -> Settings:
     w = s.wled
@@ -495,7 +477,6 @@ def apply_cli(s: Settings, args: argparse.Namespace) -> Settings:
         samp = replace(samp, patch_r=args.patch_r)
 
     return Settings(strips=s.strips, wled=w, video=v, sampling=samp, layout=lay, effects=e, lock_path=s.lock_path)
-
 
 def load_settings(argv: list[str] | None = None, app_name: str = "glowbridge") -> tuple[Settings, argparse.Namespace]:
     """

@@ -43,13 +43,16 @@ Features
 
 | Component           | Example                                                    | Approx. Price (USD) | Notes                          |
 | ------------------- | ---------------------------------------------------------- | ------------------- | ------------------------------ |
-| Raspberry Pi        | [Pi 3B+ / Pi 4 / Pi Zero 2 W](https://a.co/d/8MqKKTY)      | \$15–\$45           | Pi 3+ recommended for Ethernet |
-| HDMI → USB Capture  | [Generic UVC adapter](https://a.co/d/9cMBmpn)              | \$5–\$25            | Must support MJPEG             |
-| LED Strip           | [WS2812B](https://a.co/d/83mTGrY)                          | \$5–\$20            | ~150–300 LEDs typical          |
-| WLED Controller     | [GLEDOPTO ESP8266 WLED Controller](https://a.co/d/hd0Iq79) | \$3–$25             | ESP8266 also works             |
-| Power Supply (LEDs) | [5V 5A+](https://a.co/d/gNvGSdp)                           | \$10–\$30           | Depends on LED count           |
+| Raspberry Pi        | [Raspberry Pi Zero 2 W](https://a.co/d/8MqKKTY)            | \$15–\$45           | Pi 3+ recommended for Ethernet |
+| HDMI → USB Capture  | [Generic UVC adapter](https://a.co/d/fQUroCG)              | \$5–\$25            | Must support MJPEG             |
+| HDMI Splitter       | [OREI HDMI Splitter](https://a.co/d/9UWZyUS)               | \$10-\$30           | Keeps CEC Working              |
+| LED Strip           | [WS2811](https://a.co/d/5mM5xtX)                           | \$5–\$20            | ~150–300 LEDs typical          |
+| WLED Controller     | [GLEDOPTO ESP8266 WLED Controller](https://a.co/d/hd0Iq79) | \$3–$25             | ESP32/ESP8266 also work        |
+| Power Supply (LEDs) | [12V 5A+](https://a.co/d/gUbgMkX)                          | \$10–\$30           | Depends on LED count           |
 
-- Note: For your power needs, you can use this [WLED Calculator](https://wled-calculator.github.io/).
+- For your power needs, you can use this [WLED Calculator](https://wled-calculator.github.io/).
+- Please note: While you can use a USB capture device with an HDMI passthrough, most of these cheaper devices don't pass HDMI CEC through to the television, so things like controlling power/input/volume with your device remotes may stop working. If you depend on CEC, a Capture+Splitter combo is strongly recommended over a passthrough capture device.
+- If you watch 4K Blu-ray discs, you may want to invest in a capture device or [splitter](https://a.co/d/98BnzTq) that supports HDCP 2.2, otherwise your image will be downscaled to 1080p.
 
 ---
 
@@ -96,6 +99,10 @@ v4l2-ctl --list-devices
 ```
 
 Ensure your device (e.g., `/dev/video0`) is present and accessible.
+
+> **Video device selection**  
+> By default GlowBridge automatically selects a USB capture device using `/dev/v4l/by-id`.  
+> To override this, set `video.device` to a specific `/dev/videoX` or `/dev/v4l/by-id/...` path.
 
 ### 6. Configure GlowBridge
 
@@ -158,7 +165,6 @@ device = "/dev/video0"
 cap_w = 640
 cap_h = 480
 cap_fps = 30
-crop_to_16_9 = true
 
 [layout]
 right = 17
@@ -330,7 +336,7 @@ If your physical start corner or direction differs:
 
 ### Capture & Sampling
 
-- `video.cap_w`, `video.cap_h`, `video.cap_fps`: requested capture format (MJPEG is set by default)
+- `video.cap_w`, `video.cap_h`, `video     .cap_fps`: requested capture format (MJPEG is set by default)
 - `video.crop_to_16_9`: crop vertically to 16:9 before downsampling (recommended for HDMI sources)
 - `sampling.sample_w`, `sampling.sample_h`: downsample size used for edge sampling (smaller = faster)
 - `sampling.edge_margin`: how far inward to sample from each edge (in sample-space pixels)
