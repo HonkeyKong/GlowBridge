@@ -1,0 +1,4 @@
+# Optional dependencies for GlowBridge Web UI
+
+fastapi>=0.110
+uvicorn[standard]>=0.29

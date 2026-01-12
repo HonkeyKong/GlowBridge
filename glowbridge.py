@@ -9,13 +9,40 @@ import signal
 import socket
 import argparse
 import numpy as np
-from html import parser
+
+# Optional web UI dependencies (FastAPI + Uvicorn)
+try:
+    from fastapi import FastAPI, HTTPException, Request
+    from fastapi.responses import HTMLResponse, JSONResponse, Response
+    import uvicorn
+except Exception:  # pragma: no cover
+    FastAPI = None  # type: ignore
+    HTTPException = None  # type: ignore
+    Request = None  # type: ignore
+    HTMLResponse = None  # type: ignore
+    JSONResponse = None  # type: ignore
+    Response = None  # type: ignore
+    uvicorn = None  # type: ignore
 from pathlib import Path
 from types import SimpleNamespace
-from settings import load_settings
+from dataclasses import asdict, replace
+import threading
+from typing import Any, Dict, Optional
+
+from settings import load_settings, Settings, SamplingCfg, EffectsCfg, LayoutCfg, StripCfg, WledCfg, WledTargetCfg
 
 _lock_fd = None
 running = True
+
+# -------- Web UI runtime state --------
+_runtime_lock = threading.Lock()
+_runtime_settings: Optional[Settings] = None
+_last_rgb_preview: Optional[np.ndarray] = None  # RGB uint8
+_last_frame_jpeg: Optional[bytes] = None
+_last_led_png: Dict[str, bytes] = {}
+_last_led_colors: Dict[str, np.ndarray] = {}
+_last_stats: Dict[str, Any] = {}
+_web_token: Optional[str] = None
 
 LOCK_PATH = "/tmp/glowbridge.lock"
 
@@ -232,6 +259,355 @@ def render_preview_ansi(colors: np.ndarray, grid_idx: np.ndarray, stats: str = "
 
     sys.stdout.write("\n".join(out) + "\n")
     sys.stdout.flush()
+
+
+
+# -----------------------------
+# Web UI helpers
+# -----------------------------
+
+def _require_auth(request: "Request"):
+    if _web_token:
+        auth = request.headers.get("authorization") or ""
+        if not auth.lower().startswith("bearer "):
+            raise HTTPException(status_code=401, detail="Missing bearer token")
+        tok = auth.split(" ", 1)[1].strip()
+        if tok != _web_token:
+            raise HTTPException(status_code=403, detail="Invalid token")
+
+def _settings_to_dict(s: Settings) -> dict:
+    d = asdict(s)
+    # asdict converts tuples to lists; that's fine for JSON.
+    return d
+
+def _apply_patch_settings(cur: Settings, patch: dict) -> Settings:
+    """
+    Applies a JSON patch-like dict onto Settings using dataclasses.replace.
+    Supported keys: sampling.*, effects.* (and a few legacy layout/wled keys).
+    """
+    s = cur
+    if not isinstance(patch, dict):
+        return s
+
+    if "sampling" in patch and isinstance(patch["sampling"], dict):
+        samp = s.sampling
+        sd = patch["sampling"]
+        # only update known fields if present
+        for k in list(sd.keys()):
+            if not hasattr(samp, k):
+                sd.pop(k, None)
+        if sd:
+            samp = replace(samp, **sd)
+            s = replace(s, sampling=samp)
+
+    if "effects" in patch and isinstance(patch["effects"], dict):
+        eff = s.effects
+        ed = patch["effects"]
+        for k in list(ed.keys()):
+            if not hasattr(eff, k):
+                ed.pop(k, None)
+        if ed:
+            eff = replace(eff, **ed)
+            s = replace(s, effects=eff)
+
+    # Legacy single-strip fields
+    if "layout" in patch and isinstance(patch["layout"], dict):
+        lay = s.layout
+        ld = patch["layout"]
+        for k in list(ld.keys()):
+            if not hasattr(lay, k):
+                ld.pop(k, None)
+        if ld:
+            lay = replace(lay, **ld)
+            s = replace(s, layout=lay)
+
+    if "wled" in patch and isinstance(patch["wled"], dict):
+        w = s.wled
+        wd = patch["wled"]
+        for k in list(wd.keys()):
+            if not hasattr(w, k):
+                wd.pop(k, None)
+        if wd:
+            w = replace(w, **wd)
+            s = replace(s, wled=w)
+
+    return s
+
+def _render_led_preview_png(colors: np.ndarray, grid_idx: np.ndarray, scale: int = 16) -> bytes:
+    """
+    Render a perimeter grid preview to a PNG. Uses OpenCV for speed and avoids extra deps.
+    """
+    H, W = grid_idx.shape
+    scale = max(4, int(scale))
+    img = np.zeros((H * scale, W * scale, 3), dtype=np.uint8)
+
+    for y in range(H):
+        for x in range(W):
+            li = int(grid_idx[y, x])
+            if li < 0:
+                continue
+            r, g, b = (int(colors[li, 0]), int(colors[li, 1]), int(colors[li, 2]))
+            # OpenCV uses BGR
+            y0, y1 = y * scale, (y + 1) * scale
+            x0, x1 = x * scale, (x + 1) * scale
+            img[y0:y1, x0:x1] = (b, g, r)
+
+    ok, buf = cv2.imencode(".png", img)
+    if not ok:
+        return b""
+    return bytes(buf)
+
+def _build_app() -> "FastAPI":
+    app = FastAPI(title="GlowBridge Web UI")
+
+    @app.get("/", response_class=HTMLResponse)
+    async def index():
+        # Single-file UI: lightweight controls + previews.
+        html = """
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>GlowBridge</title>
+  <style>
+    body{font-family:system-ui,Segoe UI,Roboto,Arial,sans-serif;margin:0;background:#0b0f14;color:#e6edf3}
+    header{padding:12px 16px;background:#111826;border-bottom:1px solid #223}
+    h1{margin:0;font-size:18px}
+    .wrap{display:grid;grid-template-columns: 380px 1fr;gap:16px;padding:16px}
+    .card{background:#111826;border:1px solid #223;border-radius:10px;padding:12px}
+    label{display:block;font-size:12px;color:#9aa7b2;margin-top:10px}
+    input[type=range]{width:100%}
+    .row{display:flex;gap:10px;align-items:center}
+    .row span{min-width:70px;color:#9aa7b2;font-size:12px}
+    img{max-width:100%;border-radius:10px;border:1px solid #223;background:#000}
+    select,button,input{background:#0b0f14;color:#e6edf3;border:1px solid #223;border-radius:8px;padding:6px}
+    button{cursor:pointer}
+    small{color:#9aa7b2}
+  </style>
+</head>
+<body>
+<header><h1>GlowBridge Web UI</h1></header>
+<div class="wrap">
+  <div class="card">
+    <div class="row">
+      <span>Strip</span>
+      <select id="stripSel"></select>
+      <button id="refreshBtn">Refresh</button>
+    </div>
+
+    <label>Smoothing (smooth_alpha) <span id="smoothVal"></span></label>
+    <input id="smooth" type="range" min="0" max="0.98" step="0.01"/>
+
+    <label>Max step/frame (max_step_per_frame) <span id="stepVal"></span></label>
+    <input id="step" type="range" min="1" max="128" step="1"/>
+
+    <label>Saturation boost (sat_boost) <span id="satVal"></span></label>
+    <input id="sat" type="range" min="1.0" max="2.5" step="0.01"/>
+
+    <label>Value boost (val_boost) <span id="valVal"></span></label>
+    <input id="val" type="range" min="1.0" max="2.0" step="0.01"/>
+
+    <label>Edge margin (edge_margin) <span id="mVal"></span></label>
+    <input id="margin" type="range" min="0" max="20" step="1"/>
+
+    <label>Patch radius (patch_r) <span id="pVal"></span></label>
+    <input id="patch" type="range" min="0" max="8" step="1"/>
+
+    <div style="margin-top:12px">
+      <button id="applyBtn">Apply</button>
+      <small id="status"></small>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="row" style="justify-content:space-between">
+      <div><b>Preview</b> <small id="stats"></small></div>
+    </div>
+    <div style="display:grid;grid-template-columns: 1fr 1fr; gap:12px; margin-top:10px">
+      <div>
+        <div style="margin-bottom:6px"><small>Sampled/cropped frame</small></div>
+        <img id="frameImg" src="/api/preview/frame.jpg" />
+      </div>
+      <div>
+        <div style="margin-bottom:6px"><small>LED perimeter</small></div>
+        <img id="ledImg" src="/api/preview/led.png" />
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+const $ = (id)=>document.getElementById(id);
+let state = null;
+
+function setText(id, v){ $(id).textContent = v; }
+
+function loadState(){
+  return fetch('/api/state').then(r=>r.json()).then(s=>{
+    state = s;
+    const strips = s.strips || [];
+    const sel = $('stripSel');
+    sel.innerHTML = '';
+    for(const st of strips){
+      const opt = document.createElement('option');
+      opt.value = st.name;
+      opt.textContent = st.name;
+      sel.appendChild(opt);
+    }
+    if(strips.length){
+      sel.value = strips[0].name;
+    }
+    // populate controls
+    $('smooth').value = s.settings.effects.smooth_alpha;
+    $('step').value = s.settings.effects.max_step_per_frame;
+    $('sat').value = s.settings.effects.sat_boost;
+    $('val').value = s.settings.effects.val_boost;
+    $('margin').value = s.settings.sampling.edge_margin;
+    $('patch').value = s.settings.sampling.patch_r;
+    updateLabels();
+  });
+}
+
+function updateLabels(){
+  setText('smoothVal', Number($('smooth').value).toFixed(2));
+  setText('stepVal', $('step').value);
+  setText('satVal', Number($('sat').value).toFixed(2));
+  setText('valVal', Number($('val').value).toFixed(2));
+  setText('mVal', $('margin').value);
+  setText('pVal', $('patch').value);
+}
+
+function refreshImages(){
+  const strip = $('stripSel').value || '';
+  $('frameImg').src = '/api/preview/frame.jpg?ts=' + Date.now();
+  $('ledImg').src = '/api/preview/led.png?strip=' + encodeURIComponent(strip) + '&ts=' + Date.now();
+}
+
+async function apply(){
+  const payload = {
+    effects: {
+      smooth_alpha: Number($('smooth').value),
+      max_step_per_frame: Number($('step').value),
+      sat_boost: Number($('sat').value),
+      val_boost: Number($('val').value),
+    },
+    sampling: {
+      edge_margin: Number($('margin').value),
+      patch_r: Number($('patch').value),
+    }
+  };
+  $('status').textContent = ' applying...';
+  const r = await fetch('/api/settings', {
+    method: 'PATCH',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify(payload)
+  });
+  if(!r.ok){
+    $('status').textContent = ' error';
+    return;
+  }
+  $('status').textContent = ' applied';
+  setTimeout(()=> $('status').textContent='', 1200);
+  await loadState();
+}
+
+$('refreshBtn').onclick = ()=>{ loadState().then(refreshImages); };
+$('applyBtn').onclick = ()=>apply();
+$('stripSel').onchange = ()=>refreshImages();
+
+['smooth','step','sat','val','margin','patch'].forEach(id=>{
+  $(id).addEventListener('input', updateLabels);
+});
+
+loadState().then(()=>{
+  refreshImages();
+  setInterval(()=>{
+    refreshImages();
+    fetch('/api/state').then(r=>r.json()).then(s=>{
+      setText('stats', s.stats_line || '');
+    }).catch(()=>{});
+  }, 500);
+});
+</script>
+</body>
+</html>
+"""
+        return HTMLResponse(html)
+
+    @app.get("/api/state")
+    async def state(request: Request):
+        _require_auth(request)
+        with _runtime_lock:
+            s = _runtime_settings
+            stats = dict(_last_stats)
+        if s is None:
+            raise HTTPException(status_code=503, detail="Engine not running")
+        strips = []
+        for st in (s.strips or ()):
+            strips.append({"name": st.name, "led_count": st.led_count})
+        if not strips:
+            # legacy "default" strip
+            strips = [{"name": "default", "led_count": s.layout.led_count}]
+        # Compose a short human line
+        stats_line = ""
+        if stats:
+            stats_line = " | ".join([f"{k}={v}" for k,v in stats.items() if isinstance(v,(int,float,str))])
+        return JSONResponse({
+            "settings": _settings_to_dict(s),
+            "strips": strips,
+            "stats": stats,
+            "stats_line": stats_line,
+        })
+
+    @app.patch("/api/settings")
+    async def patch_settings(request: Request):
+        _require_auth(request)
+        patch = await request.json()
+        with _runtime_lock:
+            cur = _runtime_settings
+            if cur is None:
+                raise HTTPException(status_code=503, detail="Engine not running")
+            new_s = _apply_patch_settings(cur, patch)
+            # basic sanity
+            if not (0.0 <= new_s.effects.smooth_alpha < 1.0):
+                raise HTTPException(status_code=400, detail="smooth_alpha must be in [0.0,1.0)")
+            if new_s.effects.out_fps <= 0:
+                raise HTTPException(status_code=400, detail="out_fps must be > 0")
+            if new_s.sampling.sample_w <= 0 or new_s.sampling.sample_h <= 0:
+                raise HTTPException(status_code=400, detail="sample_w/sample_h must be > 0")
+            _runtime_settings = new_s
+        return JSONResponse({"ok": True})
+
+    @app.get("/api/preview/frame.jpg")
+    async def preview_frame(request: Request):
+        _require_auth(request)
+        with _runtime_lock:
+            jpg = _last_frame_jpeg
+        if not jpg:
+            raise HTTPException(status_code=503, detail="No preview yet")
+        return Response(content=jpg, media_type="image/jpeg")
+
+    @app.get("/api/preview/led.png")
+    async def preview_led(request: Request, strip: str = "default", scale: int = 18):
+        _require_auth(request)
+        with _runtime_lock:
+            png = _last_led_png.get(strip)
+            if png is None and strip != "default":
+                png = _last_led_png.get("default")
+        if not png:
+            raise HTTPException(status_code=503, detail="No LED preview yet")
+        return Response(content=png, media_type="image/png")
+
+    return app
+
+def start_webui(bind: str, port: int):
+    if FastAPI is None or uvicorn is None:
+        raise RuntimeError("FastAPI/Uvicorn not installed. Install requirements_optional.txt to use --web.")
+    app = _build_app()
+    config = uvicorn.Config(app, host=bind, port=int(port), log_level="warning")
+    server = uvicorn.Server(config)
+    server.run()
 
 
 def auto_crop_content_rgb(rgb_small: np.ndarray,
@@ -617,9 +993,31 @@ def main():
     test_parser.add_argument("--test-sides", action="store_true", help="Cycle sides one at a time (first/selected strip)")
     test_parser.add_argument("--test-sides-all", action="store_true", help="Color all sides at once (first/selected strip)")
     test_parser.add_argument("--strip", type=str, default=None, help="Select strip by name (defaults to first)")
+    # Web UI
+    test_parser.add_argument("--web", action="store_true", help="Enable FastAPI web UI")
+    test_parser.add_argument("--web-bind", type=str, default="0.0.0.0", help="Bind address for web UI")
+    test_parser.add_argument("--web-port", type=int, default=8787, help="Port for web UI")
+    test_parser.add_argument("--web-token", type=str, default=None, help="Optional bearer token for web UI")
     test_args, remaining = test_parser.parse_known_args(sys.argv[1:])
 
     settings, args = load_settings(remaining, app_name="glowbridge")
+
+    # Initialize runtime settings for live web tweaks
+    global _runtime_settings, _web_token
+    with _runtime_lock:
+        _runtime_settings = settings
+    _web_token = test_args.web_token
+
+    if test_args.web:
+        if FastAPI is None or uvicorn is None:
+            print('Web UI requested, but optional dependencies are not installed.')
+            print('Install them with:  pip install -r requirements_web.txt')
+            print('Or:                 pip install fastapi uvicorn[standard]')
+            return 2
+        t = threading.Thread(target=start_webui, args=(test_args.web_bind, test_args.web_port), daemon=True)
+        t.start()
+        print(f"Web UI: http://{test_args.web_bind}:{test_args.web_port} (token={'on' if _web_token else 'off'})")
+
 
     # Lock after loading settings so lock_path can be configured.
     global LOCK_PATH
@@ -684,13 +1082,27 @@ def main():
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, settings.video.cap_h)
     cap.set(cv2.CAP_PROP_FPS, settings.video.cap_fps)
 
-    frame_interval = 1.0 / max(1, settings.effects.out_fps)
-    next_t = time.perf_counter()
+    with _runtime_lock:
+        s0 = _runtime_settings or settings
+    frame_interval = 1.0 / max(1, int(s0.effects.out_fps))
+    last_out_fps = int(s0.effects.out_fps)
+    next_t = time.perf_counter() + frame_interval
 
     print("Streaming to WLED via DRGB realtime...")
     prev_colors: dict[str, np.ndarray] = {}
 
     while running:
+        # Snapshot runtime settings (for live web tweaks)
+        with _runtime_lock:
+            s = _runtime_settings or settings
+
+        # If out_fps changed, adjust pacing immediately
+        cur_fps = int(s.effects.out_fps)
+        if cur_fps != last_out_fps and cur_fps > 0:
+            last_out_fps = cur_fps
+            frame_interval = 1.0 / max(1, cur_fps)
+            next_t = time.perf_counter() + frame_interval
+
         # pace output
         now = time.perf_counter()
         if now < next_t:
@@ -703,19 +1115,31 @@ def main():
             continue
 
         # Downsample for cheap sampling
-        frame_small = cv2.resize(frame, (settings.sampling.sample_w, settings.sampling.sample_h), interpolation=cv2.INTER_AREA)
+        frame_small = cv2.resize(frame, (s.sampling.sample_w, s.sampling.sample_h), interpolation=cv2.INTER_AREA)
         # Convert to RGB
         rgb = cv2.cvtColor(frame_small, cv2.COLOR_BGR2RGB)
         
-        if settings.sampling.auto_crop_black_bars:
+        if s.sampling.auto_crop_black_bars:
             rgb = auto_crop_content_rgb(
                 rgb,
-                luma_thresh=settings.sampling.crop_luma_threshold,
-                min_percent=settings.sampling.crop_min_percent,
-                pad=settings.sampling.crop_pad,
-                min_w=settings.sampling.crop_min_w,
-                min_h=settings.sampling.crop_min_h,
+                luma_thresh=s.sampling.crop_luma_threshold,
+                min_percent=s.sampling.crop_min_percent,
+                pad=s.sampling.crop_pad,
+                min_w=s.sampling.crop_min_w,
+                min_h=s.sampling.crop_min_h,
             )
+        # Update web preview of sampled/cropped frame
+        if FastAPI is not None:
+            try:
+                ok_j, buf_j = cv2.imencode('.jpg', cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR), [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+                if ok_j:
+                    with _runtime_lock:
+                        global _last_rgb_preview, _last_frame_jpeg
+                        _last_rgb_preview = rgb
+                        _last_frame_jpeg = bytes(buf_j)
+            except Exception:
+                pass
+
         # Build DRGB packet
 
         # Send to all configured strips/targets
@@ -724,15 +1148,31 @@ def main():
             colors_raw = build_led_colors_from_frame(
                 rgb,
                 lay.right, lay.top, lay.left, lay.bottom,
-                settings.sampling.edge_margin, settings.sampling.patch_r
+                s.sampling.edge_margin, s.sampling.patch_r
             )
 
             prev = prev_colors.get(st.name)
             if prev is None or prev.shape != colors_raw.shape:
                 prev = colors_raw.copy()
 
-            colors_out, prev_f = apply_effects(colors_raw, prev, settings.effects)
+            colors_out, prev_f = apply_effects(colors_raw, prev, s.effects)
             prev_colors[st.name] = prev_f
+
+            # Update web preview of LED colors (per strip)
+            if FastAPI is not None:
+                try:
+                    grid = build_preview_grid(colors_out, lay.right, lay.top, lay.left, lay.bottom)
+                    png = _render_led_preview_png(colors_out, grid, scale=18)
+                    with _runtime_lock:
+                        _last_led_colors[st.name] = colors_out.copy()
+                        _last_led_png[st.name] = png
+                        _last_stats.update({
+                            'fps': last_out_fps,
+                            'frame_w': int(rgb.shape[1]),
+                            'frame_h': int(rgb.shape[0]),
+                        })
+                except Exception:
+                    pass
 
             # --- Preview (selected strip only) ---
             if args.preview and st is strip:

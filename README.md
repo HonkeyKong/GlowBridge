@@ -1,6 +1,6 @@
 # GlowBridge
 
-**GlowBridge** is a lightweight, low-latency Python ambilight-style system that captures video from a V4L2 device (e.g., HDMI-to-USB), samples edge colors, and streams them to one or more **WLED** controllers via UDP Realtime (DRGB).
+**GlowBridge** is a lightweight, low-latency Python ambient lighting system that captures video from a V4L2 device (e.g., HDMI-to-USB), samples edge colors, and streams them to one or more **WLED** controllers via UDP Realtime (DRGB).
 
 It's designed to be simple, hackable, low-CPU (Raspberry Pi friendly), and free of proprietary software or cloud dependencies. Supports multiple independent LED strips and WLED devices for whole-room ambient lighting.
 
@@ -10,7 +10,7 @@ Features
 
 - V4L2 capture with MJPEG for low CPU usage
 - **Multi-strip support**: Send different edge sections to multiple WLED devices simultaneously
-- **Flexible side mapping**: Enable/disable individual sides per strip (e.g., only use bottom+left LEDs)
+- **Flexible side mapping**: Enable/disable individual sides per strip (e.g., only sample bottom+left of image)
 - Edge sampling with configurable patch averaging and margins
 - Black-threshold suppression to prevent shimmer in dark scenes
 - Scene-cut detection with faster transitions on large luminance changes
@@ -28,12 +28,14 @@ Features
 - Linux with a working **V4L2** capture device (e.g., `/dev/video0`)
 - Python **3.11+** recommended
 - Python packages: `opencv-python`, `numpy`
+- Optional packages for web UI: `fastapi`, `uvicorn`
 
 ### Hardware
 
 - HDMI → USB capture device (UVC compliant)
+- HDMI Splitter recommended instead of capture passthrough.
 - Addressable LED strip (WS2812B / SK6812 / similar)
-- WLED controller (ESP8266 or ESP32)
+- WLED controller ([ESP8266](https://www.amazon.com/s?k=ESP8266&tag=honkeykong-20), [ESP32](https://www.amazon.com/s?k=ESP32&tag=honkeykong-20) or [one of many dedicated WLED devices](https://www.amazon.com/s?k=wled+controller&tag=honkeykong-20))
 - Local network connectivity between host and WLED device
 - OpenCV (on Raspberry Pi: `sudo apt install python3-opencv`)
 
@@ -41,14 +43,14 @@ Features
 
 ## Bill of Materials
 
-| Component           | Example                                                    | Approx. Price (USD) | Notes                          |
-| ------------------- | ---------------------------------------------------------- | ------------------- | ------------------------------ |
-| Raspberry Pi        | [Raspberry Pi Zero 2 W](https://a.co/d/8MqKKTY)            | \$15–\$45           | Pi 3+ recommended for Ethernet |
-| HDMI → USB Capture  | [Generic UVC adapter](https://a.co/d/fQUroCG)              | \$5–\$25            | Must support MJPEG             |
-| HDMI Splitter       | [OREI HDMI Splitter](https://a.co/d/9UWZyUS)               | \$10-\$30           | Keeps CEC Working              |
-| LED Strip           | [WS2811](https://a.co/d/5mM5xtX)                           | \$5–\$20            | ~150–300 LEDs typical          |
-| WLED Controller     | [GLEDOPTO ESP8266 WLED Controller](https://a.co/d/hd0Iq79) | \$3–$25             | ESP32/ESP8266 also work        |
-| Power Supply (LEDs) | [12V 5A+](https://a.co/d/gUbgMkX)                          | \$10–\$30           | Depends on LED count           |
+| Component           | Example                                                  | Approx. Price (USD) | Notes                          |
+| ------------------- | -------------------------------------------------------- | ------------------- | ------------------------------ |
+| Raspberry Pi        | [Raspberry Pi Zero 2 W](https://a.co/d/8MqKKTY)          | \$15–\$45           | Pi 3+ recommended for Ethernet |
+| HDMI → USB Capture  | [Generic UVC adapter](https://a.co/d/fQUroCG)            | \$5–\$25            | Must support MJPEG             |
+| HDMI Splitter       | [OREI HDMI Splitter](https://a.co/d/9UWZyUS)             | \$10-\$30           | Keeps CEC Working              |
+| LED Strip           | [WS2811](https://a.co/d/5mM5xtX)                         | \$5–\$20            | ~150–300 LEDs typical          |
+| WLED Controller     | [GLEDOPTO ESP32 WLED Controller](https://a.co/d/d9k1Vah) | \$3–$30             | ESP32/ESP8266 also work        |
+| Power Supply (LEDs) | [12V 5A+](https://a.co/d/gUbgMkX)                        | \$10–\$30           | Depends on LED count           |
 
 - For your power needs, you can use this [WLED Calculator](https://wled-calculator.github.io/).
 - Please note: While you can use a USB capture device with an HDMI passthrough, most of these cheaper devices don't pass HDMI CEC through to the television, so things like controlling power/input/volume with your device remotes may stop working. If you depend on CEC, a Capture+Splitter combo is strongly recommended over a passthrough capture device.
@@ -90,6 +92,12 @@ source venv/bin/activate
 
 ```bash
 pip install -r requirements.txt
+```
+
+#### 4.1 (Optional) Web UI dependencies
+
+```bash
+pip install -r requirements_webui.txt
 ```
 
 ### 5. Verify your V4L2 capture device
@@ -336,8 +344,7 @@ If your physical start corner or direction differs:
 
 ### Capture & Sampling
 
-- `video.cap_w`, `video.cap_h`, `video     .cap_fps`: requested capture format (MJPEG is set by default)
-- `video.crop_to_16_9`: crop vertically to 16:9 before downsampling (recommended for HDMI sources)
+- `video.cap_w`, `video.cap_h`, `video.cap_fps`: requested capture format (MJPEG is set by default)
 - `sampling.sample_w`, `sampling.sample_h`: downsample size used for edge sampling (smaller = faster)
 - `sampling.edge_margin`: how far inward to sample from each edge (in sample-space pixels)
 - `sampling.patch_r`: patch radius (2 → 5×5); larger values smooth noisy sources
@@ -375,6 +382,21 @@ python3 glowbridge.py --test-sides-all
 ```
 
 While a test is running, the script continues sending packets to keep WLED in Realtime mode.
+
+---
+
+### Web UI (Optional)
+
+GlowBridge includes an optional FastAPI-based web interface for live previews and runtime tweaking.
+
+To enable it:
+
+```bash
+pip install -r requirements_webui.txt 
+python3 glowbridge.py --web
+```
+
+By default, the UI binds to `0.0.0.0:8787`.
 
 ---
 
@@ -416,38 +438,4 @@ While a test is running, the script continues sending packets to keep WLED in Re
 
 ## Optional: Systemd Service
 
-For auto-start, create a systemd service that runs this script on boot once your capture device is ready. Ensure you export your venv or use system Python with required packages installed.
-
-```ini
-[Unit]
-Description=GlowBridge Ambient Lighting Service
-After=network-online.target
-Wants=network-online.target
-
-# If your capture device is USB, this helps avoid race conditions
-After=dev-video0.device
-Requires=dev-video0.device
-
-[Service]
-Type=simple
-User=youruser
-Group=video
-
-ExecStart=/usr/bin/python3 /path/to/glowbridge_folder/glowbridge.py
-WorkingDirectory=/path/to/glowbridge_folder
-
-# Restart if the capture device or script hiccups
-Restart=on-failure
-RestartSec=2
-
-# Clean shutdown
-KillSignal=SIGTERM
-TimeoutStopSec=5
-
-# Basic hardening (safe defaults)
-NoNewPrivileges=true
-PrivateTmp=true
-
-[Install]
-WantedBy=multi-user.target
-```
+For auto-start, edit the systemd service at `systemd/glowbridge.service` and install it to run this script on boot once your capture device is ready. Ensure you export your venv or use system Python with required packages installed.
