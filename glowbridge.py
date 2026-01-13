@@ -603,7 +603,7 @@ loadState().then(()=>{
 
 def start_webui(bind: str, port: int):
     if FastAPI is None or uvicorn is None:
-        raise RuntimeError("FastAPI/Uvicorn not installed. Install requirements_optional.txt to use --web.")
+        raise RuntimeError("FastAPI/Uvicorn not installed. Install requirements_webui.txt to use --web.")
     app = _build_app()
     config = uvicorn.Config(app, host=bind, port=int(port), log_level="warning")
     server = uvicorn.Server(config)
@@ -757,74 +757,83 @@ def handle_sigint(sig, frame):
 signal.signal(signal.SIGINT, handle_sigint)
 signal.signal(signal.SIGTERM, handle_sigint)
 
-# def crop_center_16_9(frame_bgr: np.ndarray) -> np.ndarray:
-#     h, w = frame_bgr.shape[:2]
-#     target_h = int(w * 9 / 16)
-#     if target_h <= 0 or target_h > h:
-#         return frame_bgr  # can't crop sensibly, return as-is
-#     y0 = (h - target_h) // 2
-#     return frame_bgr[y0:y0 + target_h, :]
-
 def sample_patch_rgb(img_rgb: np.ndarray, x: int, y: int, r: int) -> np.ndarray:
     h, w = img_rgb.shape[:2]
+
+    x = max(0, min(w - 1, int(x)))
+    y = max(0, min(h - 1, int(y)))
+
+    if r <= 0:
+        return img_rgb[y, x]
+
     x0 = max(0, x - r)
     x1 = min(w, x + r + 1)
     y0 = max(0, y - r)
     y1 = min(h, y + r + 1)
-    
-    patch = img_rgb[y0:y1, x0:x1].reshape(-1, 3).astype(np.int32)
-    # sort by luma, keep the top fraction 
-    luma = (54*patch[:,0] + 183*patch[:,1] + 19*patch[:,2])  # int32 safe
-    # scaled 
-    keep = max(1, int(len(luma) * 0.25)) 
-    # top 25% 
-    idx = np.argpartition(luma, -keep)[-keep:] 
-    mean = patch[idx].mean(axis=0) 
-    return np.clip(mean, 0, 255).astype(np.uint8)
 
+    # OpenCV mean is implemented in C and is much faster than per-LED NumPy work
+    roi = img_rgb[y0:y1, x0:x1]
+    m = cv2.mean(roi)  # returns (R, G, B, A?) as floats
+    return np.array([int(m[0]), int(m[1]), int(m[2])], dtype=np.uint8)
 
 def build_led_colors_from_frame(sample_rgb: np.ndarray,
                                 right: int, top: int, left: int, bottom: int,
                                 edge_margin: int, patch_r: int) -> np.ndarray:
+    """
+    Fast vectorized sampler:
+    - Assumes sample_rgb is already blurred if you want patch averaging.
+    - Ignores patch_r (kept in signature for compatibility).
+    """
     h, w = sample_rgb.shape[:2]
-    m = max(0, min(edge_margin, w - 1, h - 1))
-    r = patch_r
+    m = int(max(0, min(edge_margin, w - 1, h - 1)))
 
-    led_count = max(0, right) + max(0, top) + max(0, left) + max(0, bottom)
+    rN = max(0, int(right))
+    tN = max(0, int(top))
+    lN = max(0, int(left))
+    bN = max(0, int(bottom))
+
+    led_count = rN + tN + lN + bN
     colors = np.zeros((led_count, 3), dtype=np.uint8)
+    if led_count == 0:
+        return colors
+
     idx = 0
 
-    if right > 0:
-        x = w - 1 - m
-        for i in range(right):
-            t = (i + 0.5) / right
-            y = int((h - 1 - m) * (1.0 - t) + m * t)
-            colors[idx] = sample_patch_rgb(sample_rgb, x, y, r)
-            idx += 1
+    # RIGHT column: bottom->top
+    if rN:
+        x = (w - 1 - m)
+        t = (np.arange(rN, dtype=np.float32) + 0.5) / float(rN)
+        y = ((h - 1 - m) * (1.0 - t) + m * t).astype(np.int32)
+        y = np.clip(y, 0, h - 1)
+        colors[idx:idx+rN] = sample_rgb[y, x]
+        idx += rN
 
-    if top > 0:
+    # TOP row: right->left
+    if tN:
         y = m
-        for i in range(top):
-            t = (i + 0.5) / top
-            x = int((w - 1 - m) * (1.0 - t) + m * t)
-            colors[idx] = sample_patch_rgb(sample_rgb, x, y, r)
-            idx += 1
+        t = (np.arange(tN, dtype=np.float32) + 0.5) / float(tN)
+        x = ((w - 1 - m) * (1.0 - t) + m * t).astype(np.int32)
+        x = np.clip(x, 0, w - 1)
+        colors[idx:idx+tN] = sample_rgb[y, x]
+        idx += tN
 
-    if left > 0:
+    # LEFT column: top->bottom
+    if lN:
         x = m
-        for i in range(left):
-            t = (i + 0.5) / left
-            y = int(m * (1.0 - t) + (h - 1 - m) * t)
-            colors[idx] = sample_patch_rgb(sample_rgb, x, y, r)
-            idx += 1
+        t = (np.arange(lN, dtype=np.float32) + 0.5) / float(lN)
+        y = (m * (1.0 - t) + (h - 1 - m) * t).astype(np.int32)
+        y = np.clip(y, 0, h - 1)
+        colors[idx:idx+lN] = sample_rgb[y, x]
+        idx += lN
 
-    if bottom > 0:
-        y = h - 1 - m
-        for i in range(bottom):
-            t = (i + 0.5) / bottom
-            x = int(m * (1.0 - t) + (w - 1 - m) * t)
-            colors[idx] = sample_patch_rgb(sample_rgb, x, y, r)
-            idx += 1
+    # BOTTOM row: left->right
+    if bN:
+        y = (h - 1 - m)
+        t = (np.arange(bN, dtype=np.float32) + 0.5) / float(bN)
+        x = (m * (1.0 - t) + (w - 1 - m) * t).astype(np.int32)
+        x = np.clip(x, 0, w - 1)
+        colors[idx:idx+bN] = sample_rgb[y, x]
+        idx += bN
 
     return colors
 
@@ -1011,7 +1020,8 @@ def main():
     if test_args.web:
         if FastAPI is None or uvicorn is None:
             print('Web UI requested, but optional dependencies are not installed.')
-            print('Install them with:  pip install -r requirements_web.txt')
+            print('Install them with:  pip install -r requirements_webui.txt')
+            print('or, on Raspbian:   sudo apt install python3-fastapi python3-uvicorn')
             print('Or:                 pip install fastapi uvicorn[standard]')
             return 2
         t = threading.Thread(target=start_webui, args=(test_args.web_bind, test_args.web_port), daemon=True)
@@ -1086,7 +1096,11 @@ def main():
         s0 = _runtime_settings or settings
     frame_interval = 1.0 / max(1, int(s0.effects.out_fps))
     last_out_fps = int(s0.effects.out_fps)
-    next_t = time.perf_counter() + frame_interval
+    next_t = time.perf_counter()
+
+    # Throttle expensive web preview encodes so they don't steal render time.
+    preview_interval = 1.0 / 5.0  # 5 Hz web UI updates
+    next_preview_t = 0.0
 
     print("Streaming to WLED via DRGB realtime...")
     prev_colors: dict[str, np.ndarray] = {}
@@ -1101,18 +1115,18 @@ def main():
         if cur_fps != last_out_fps and cur_fps > 0:
             last_out_fps = cur_fps
             frame_interval = 1.0 / max(1, cur_fps)
-            next_t = time.perf_counter() + frame_interval
-
-        # pace output
-        now = time.perf_counter()
-        if now < next_t:
-            time.sleep(max(0.0, next_t - now))
-        next_t += frame_interval
+            next_t = time.perf_counter()
 
         ok, frame = cap.read()
         if not ok or frame is None:
             # If capture hiccups, just skip this frame
             continue
+
+        # Gate processing/sending rate to out_fps (avoid "double pacing")
+        now = time.perf_counter()
+        if now < next_t:
+            continue
+        next_t = now + frame_interval
 
         # Downsample for cheap sampling
         frame_small = cv2.resize(frame, (s.sampling.sample_w, s.sampling.sample_h), interpolation=cv2.INTER_AREA)
@@ -1128,8 +1142,24 @@ def main():
                 min_w=s.sampling.crop_min_w,
                 min_h=s.sampling.crop_min_h,
             )
+
+        # If patch_r > 0, blur once and do single-pixel sampling from the blurred image.
+        # This replaces per-LED patch averaging with one fast C blur per frame.
+        if s.sampling.patch_r > 0:
+            k = (2 * int(s.sampling.patch_r) + 1)
+            rgb_sample = cv2.blur(rgb, (k, k))
+        else:
+            rgb_sample = rgb
+
+        # rgb = cv2.blur(rgb, (5, 5))
+
+        do_preview = (FastAPI is not None) and (now >= next_preview_t)
+        if do_preview:
+            next_preview_t = now + preview_interval
+
         # Update web preview of sampled/cropped frame
-        if FastAPI is not None:
+        # if FastAPI is not None:
+        if do_preview:
             try:
                 ok_j, buf_j = cv2.imencode('.jpg', cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR), [int(cv2.IMWRITE_JPEG_QUALITY), 80])
                 if ok_j:
@@ -1146,7 +1176,7 @@ def main():
         for st in strips:
             lay = st.layout
             colors_raw = build_led_colors_from_frame(
-                rgb,
+                rgb_sample,
                 lay.right, lay.top, lay.left, lay.bottom,
                 s.sampling.edge_margin, s.sampling.patch_r
             )
@@ -1159,7 +1189,8 @@ def main():
             prev_colors[st.name] = prev_f
 
             # Update web preview of LED colors (per strip)
-            if FastAPI is not None:
+            # if FastAPI is not None:
+            if do_preview:
                 try:
                     grid = build_preview_grid(colors_out, lay.right, lay.top, lay.left, lay.bottom)
                     png = _render_led_preview_png(colors_out, grid, scale=18)

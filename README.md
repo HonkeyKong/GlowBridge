@@ -391,10 +391,11 @@ GlowBridge includes an optional FastAPI-based web interface for live previews an
 
 To enable it:
 
-```bash
-pip install -r requirements_webui.txt 
-python3 glowbridge.py --web
-```
+`pip install -r requirements_webui.txt `
+or on Raspbian:
+`sudo apt update && sudo apt install python3-fastapi python3-uvicorn`
+then
+`python3 glowbridge.py --web`
 
 By default, the UI binds to `0.0.0.0:8787`.
 
