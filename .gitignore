@@ -30,6 +30,9 @@ MANIFEST
 copyToPi.sh
 restartGlow.sh
 
+# Fucking patchfiles...
+*.patch
+
 # Config file in case I test locally
 config.toml
 
